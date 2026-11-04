@@ -49,6 +49,58 @@ window.__ModuleLoader__.load({
       return n + ' 字符';
     }
 
+    /**
+     * The success box an action deserves, or null while the surface still shows
+     * the pre-action state.
+     *
+     * Shared by the render-time watcher and its fallback timer so both judge by
+     * the same rule: the timer must never report "nothing changed" for an action
+     * the list has already proven.
+     */
+    function settledFeedback(pending, turns) {
+      if (pending.action === 'delete_turn') {
+        // A removed turn stops being a question row: the Host splices a removal
+        // marker into its place, so the mark keeps the SAME label.
+        const tombstoned = turns.some((x) => x.label === pending.label && x.removed);
+        const vanished = pending.userSeq !== null
+          && !turns.some((x) => x.userSeq === pending.userSeq);
+        if (!tombstoned && !vanished) return null;
+        return {
+          kind: 'ok',
+          text: `已移除第 ${pending.label} 轮：原 ${pending.beforeTools} 次工具调用与问答不再进入请求`,
+        };
+      }
+
+      // Trim and strip keep the question, so the row is still addressed by the
+      // user message it starts at.
+      if (pending.userSeq === null) return null;
+      const now = turns.find((x) => x.userSeq === pending.userSeq);
+      if (!now) return null;
+      if (
+        now.trimmed === pending.beforeTrimmed &&
+        now.injectedStripped === pending.beforeStripped
+      ) {
+        return null;
+      }
+      if (pending.action === 'strip_injected') {
+        return {
+          kind: 'ok',
+          text: `已清除第 ${pending.label} 轮的系统注入上下文（${pending.beforeInjected} 条）`,
+        };
+      }
+      return {
+        kind: 'ok',
+        text:
+          '已修剪第 ' +
+          pending.label +
+          ' 轮：工具调用 ' +
+          pending.beforeTools +
+          ' → ' +
+          now.toolCalls +
+          (now.removedChars > 0 ? '，约移除 ' + fmtChars(now.removedChars) : ''),
+      };
+    }
+
     function previewText(content, maxLen) {
       const limit = typeof maxLen === 'number' ? maxLen : 90;
       if (content == null) return '';
@@ -84,6 +136,11 @@ window.__ModuleLoader__.load({
      * surface event carries the `surfaceOp` that placed it. Honouring those ops
      * locally reproduces what the model will actually read — so a trim shows up
      * here immediately, without asking the Host.
+     *
+     * A replacement SPLICES IN PLACE (`surface.js`: `nodes.splice(startIdx, …)`),
+     * it does not append at the tail: the marker stands where the shadowed range
+     * began. Appending it would move every later turn's boundary — which reads
+     * as "the trim landed on the wrong turn" for anything but the newest one.
      */
     function surfaceEvents(entries) {
       const visible = [];
@@ -99,12 +156,25 @@ window.__ModuleLoader__.load({
         if (op && typeof op === 'object' && op.op === 'replace') {
           const start = Number(op.startSeq);
           const end = Number(op.endSeq);
-          for (let i = visible.length - 1; i >= 0; i--) {
+          const startIdx = visible.indexOf(start);
+          const endIdx = visible.indexOf(end);
+          if (startIdx !== -1 && endIdx !== -1 && startIdx <= endIdx) {
+            visible.splice(startIdx, endIdx - startIdx + 1, ev.seq);
+            continue;
+          }
+          // One edge is outside this window: drop the part of the range that is
+          // visible and put the marker where that part began. Nothing visible
+          // matched, so the range lies before the window — the marker leads it.
+          let at = -1;
+          for (let i = visible.length - 1; i >= 0; i -= 1) {
             const s = visible[i];
             if (Number.isFinite(start) && Number.isFinite(end) && s >= start && s <= end) {
+              at = i;
               visible.splice(i, 1);
             }
           }
+          visible.splice(at === -1 ? 0 : at, 0, ev.seq);
+          continue;
         }
         visible.push(ev.seq);
       }
@@ -122,6 +192,28 @@ window.__ModuleLoader__.load({
     const DELETE_KIND = 'context-trimmer-removed';
     const INJECT_KIND = 'context-trimmer-stripped';
 
+    /**
+     * The harness-injected kinds this panel may offer to clear.
+     *
+     * An allow-list on purpose: a `user/message` is not "injected context" just
+     * because its kind is not `'user'`. The same slot carries
+     * `compact-checkpoint` (the summary that replaced the earlier history),
+     * `user-question-reply` (the user's own answer), `goal`, `team-message`,
+     * `agent-message` and `agent-instructions`; offering to clear those would
+     * delete content the user never asked to lose. Every entry here is an
+     * `agent.inject()` notice, never typed text.
+     */
+    const INJECTED_KINDS = new Set([
+      'runtime-context',
+      'time-context',
+      'skill-catalog',
+      'skill-invocation',
+      'model-selection',
+      'working-directory',
+      'user-approval',
+      'tmux-context',
+    ]);
+
     function isOwnReplacement(ev) {
       if (!ev || ev.type !== 'user/message') return false;
       const src = (ev.data || {}).source;
@@ -130,14 +222,29 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** A message the human typed; anything else stored as user/message is
-     * harness-injected context (runtime-context, time-context, skill-catalog…). */
+    /** The marker that stands where a removed turn used to be. */
+    function isRemovedMarker(ev) {
+      if (!ev || ev.type !== 'user/message') return false;
+      const src = (ev.data || {}).source;
+      return Boolean(src) && src.kind === DELETE_KIND;
+    }
+
+    /** A message the human typed; a user/message of any other kind is not one. */
     function isRealUserEvent(ev) {
       if (!ev || ev.type !== 'user/message') return false;
       if (isOwnReplacement(ev)) return false;
       const src = (ev.data || {}).source;
       return !src || src.kind === 'user';
     }
+
+    /** Harness injection this panel may show (and offer to clear). */
+    function isInjectedEvent(ev) {
+      if (!ev || ev.type !== 'user/message') return false;
+      if (isOwnReplacement(ev)) return false;
+      const src = (ev.data || {}).source;
+      return Boolean(src) && INJECTED_KINDS.has(src.kind);
+    }
+
     function injectedKindOf(ev) {
       const src = (ev.data || {}).source;
       return (src && src.kind) || 'injected';
@@ -161,9 +268,11 @@ window.__ModuleLoader__.load({
           assistantTurn: null,
           firstSeq: seq,
           lastSeq: seq,
+          nodes: 1,
           user: '',
           userSeq: null,
           assistant: '',
+          removed: false,
           toolCalls: 0,
           injected: [],
           injectedChars: 0,
@@ -171,30 +280,63 @@ window.__ModuleLoader__.load({
         };
       }
 
+      /**
+       * Start a row and adopt any context that preceded its boundary.
+       *
+       * `firstSeq`/`lastSeq` are POSITIONS in surface order, never min/max: a
+       * replacement event carries a tail seq yet sits mid-surface, so "smallest
+       * seq" is not "first node".
+       */
+      function open(seq, userSeq, removed) {
+        const row = blank(seq);
+        row.userSeq = userSeq;
+        row.removed = removed;
+        for (const p of pending) {
+          if (row.firstSeq === seq) row.firstSeq = p.seq;
+          row.lastSeq = p.seq;
+          row.nodes += 1;
+          if (isInjectedEvent(p)) {
+            row.injected.push(injectedKindOf(p));
+            row.injectedChars += textOf((p.data || {}).content).length;
+          }
+        }
+        pending = [];
+        return row;
+      }
+
       for (const ev of surface) {
         const type = ev.type;
         if (type !== 'user/message' && type !== 'assistant/message' && type !== 'tool/result') continue;
 
+        // A removal marker is a row of its own: it stands where the removed
+        // question used to be, so every later label keeps its number.
+        if (isRemovedMarker(ev)) {
+          const row = open(ev.seq, null, true);
+          row.lastSeq = ev.seq;
+          groups.push(row);
+          current = null;
+          continue;
+        }
+
         if (isRealUserEvent(ev)) {
-          current = blank(ev.seq);
-          for (const p of pending) {
-            current.firstSeq = Math.min(current.firstSeq, p.seq);
-            current.injected.push(injectedKindOf(p));
-            current.injectedChars += textOf((p.data || {}).content).length;
-          }
-          pending = [];
-          current.userSeq = ev.seq;
-          groups.push(current);
-        } else if (type === 'user/message') {
-          const text = textOf((ev.data || {}).content);
+          const row = open(ev.seq, ev.seq, false);
+          row.lastSeq = ev.seq;
+          const t = previewText((ev.data || {}).content, 160);
+          if (t) row.user = t;
+          groups.push(row);
+          current = row;
+          continue;
+        }
+
+        if (type === 'user/message') {
           if (current === null) {
             pending.push(ev);
             continue;
           }
-          current.firstSeq = Math.min(current.firstSeq, ev.seq);
-          current.lastSeq = Math.max(current.lastSeq, ev.seq);
+          current.lastSeq = ev.seq;
+          current.nodes += 1;
 
-          // Our own replacements carry the outcome, keyed by source kind.
+          // Our own trim/strip markers carry the outcome, keyed by source kind.
           const src = (ev.data || {}).source || {};
           if (src.kind === INJECT_KIND) {
             current.injectedStripped = true;
@@ -206,31 +348,22 @@ window.__ModuleLoader__.load({
             if (t) current.assistant = t;
             continue;
           }
-          if (src.kind === DELETE_KIND) {
-            current.deletedMarker = true;
-            continue;
-          }
-          if (text.indexOf('已清除的系统注入上下文') >= 0) {
-            current.injectedStripped = true;
-          } else {
+          if (isInjectedEvent(ev)) {
             current.injected.push(injectedKindOf(ev));
-            current.injectedChars += text.length;
+            current.injectedChars += textOf((ev.data || {}).content).length;
           }
           continue;
-        } else {
-          if (current === null) {
-            current = blank(ev.seq);
-            groups.push(current);
-          }
-          current.firstSeq = Math.min(current.firstSeq, ev.seq);
-          current.lastSeq = Math.max(current.lastSeq, ev.seq);
         }
 
-        const data = ev.data || {};
-        if (type === 'user/message') {
-          const t = previewText(data.content, 160);
-          if (t) current.user = t;
-        } else if (type === 'assistant/message') {
+        if (current === null) {
+          pending.push(ev);
+          continue;
+        }
+        current.lastSeq = ev.seq;
+        current.nodes += 1;
+
+        if (type === 'assistant/message') {
+          const data = ev.data || {};
           const content = data.message && data.message.content;
           if (hasToolCallBlocks(content)) {
             current.toolCalls += content.filter(b => b && b.type === 'tool-call').length;
@@ -251,8 +384,6 @@ window.__ModuleLoader__.load({
       // while a turn is still running joins that turn, so two questions can share
       // `turn: 1` and a per-turn tally would report the same tool calls for each
       // of them — which renders as "everything has been trimmed".
-      let surfaceChars = 0;
-
       const allEvents = [];
       for (const entry of Array.isArray(entries) ? entries : []) {
         if (!entry || entry.type !== 'event' || !entry.event) continue;
@@ -295,11 +426,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      for (const ev of surface) {
-        if (ev.type !== 'tool/result') continue;
-        surfaceChars += textOf((ev.data || {}).message && ev.data.message.content).length;
-      }
-
       // The Host logs every command outcome as `command/done`; the client's
       // session.command() only reports "matched", so this is the only place a
       // rejection becomes readable. Only the NEWEST one is offered, and the
@@ -320,7 +446,42 @@ window.__ModuleLoader__.load({
         };
       }
 
+      // The window is the only view this half has. A `turn/start` with no
+      // `turn/end` after it means the last question is still being answered; the
+      // Host re-checks the same condition against the whole log before writing.
+      let openTurn = null;
+      for (const ev of allEvents) {
+        if (ev.type === 'turn/start') {
+          openTurn = typeof (ev.data || {}).turn === 'number' ? ev.data.turn : null;
+        } else if (ev.type === 'turn/end') {
+          openTurn = null;
+        }
+      }
+      const lastIndex = groups.length - 1;
+
       return { turns: groups.map((g, i) => {
+        if (g.removed) {
+          return {
+            turn: i + 1,
+            label: i + 1,
+            startSeq: g.firstSeq,
+            endSeq: g.lastSeq,
+            nodeCount: g.nodes,
+            userSeq: null,
+            toolCalls: 0,
+            logToolCalls: 0,
+            removedChars: 0,
+            trimmed: false,
+            removed: true,
+            running: false,
+            injectedCount: 0,
+            injectedKinds: [],
+            injectedChars: 0,
+            injectedStripped: false,
+            user: '',
+            assistant: '',
+          };
+        }
         const range = rangeFor(g.userSeq);
         const bucket = range === null ? undefined : logByUser.get(range.from);
         const logToolCalls = bucket ? bucket.calls : g.toolCalls;
@@ -328,18 +489,22 @@ window.__ModuleLoader__.load({
         // The replacement marker is authoritative; the count gap is a fallback
         // for surfaces written before this plugin recorded its own kind.
         const trimmed = Boolean(g.trimmedMarker) || logToolCalls > g.toolCalls;
-        const deleted = Boolean(g.deletedMarker);
+        const running = i === lastIndex
+          && openTurn !== null
+          && (g.assistantTurn === null || g.assistantTurn === openTurn);
         return {
           turn: i + 1,
           label: i + 1,
           startSeq: g.firstSeq,
           endSeq: g.lastSeq,
+          nodeCount: g.nodes,
           userSeq: g.userSeq,
           toolCalls: g.toolCalls,
           logToolCalls,
           removedChars: trimmed ? turnChars : 0,
           trimmed,
-          deleted,
+          removed: false,
+          running,
           injectedCount: g.injected.length,
           injectedKinds: g.injected,
           injectedChars: g.injectedChars,
@@ -386,7 +551,9 @@ window.__ModuleLoader__.load({
         }
         if (!binding && typeof sessions.retain === 'function') {
           try {
-            owned = sessions.retain({ id: sessionId }, { source: 'gateway' });
+            // `retain` resolves a session-id STRING (or a `{childSessionId}`
+            // subagent address); `{ id }` resolves to nothing.
+            owned = sessions.retain(sessionId, { source: 'context-trimmer' });
             binding = owned && owned.binding;
           } catch (err) {
             setState({ status: 'error', window: null, reason: '无法保留会话：' + errText(err) });
@@ -451,8 +618,9 @@ window.__ModuleLoader__.load({
           const remote = ctx && ctx.remote;
           const commands = remote && remote.commands;
           if (commands && typeof commands.execute === 'function') {
-            return (line) =>
-              commands.execute({ id: sessionId }, line, [], new AbortController().signal);
+            // The remote takes a session id, the line, and the submitted
+            // attachments — the same shape `binding.session.command` sends.
+            return (line) => commands.execute(sessionId, line, []);
           }
         } catch { /* ignore */ }
         return null;
@@ -473,9 +641,13 @@ window.__ModuleLoader__.load({
         const fallback = remoteChannel();
         if (fallback) {
           const res = await fallback(line);
-          const result = res && res.result;
+          if (res && res.ok === false) {
+            throw new Error((res.error && res.error.message) || '命令执行失败');
+          }
+          const value = res && res.ok === true ? res.value : res;
+          const result = value && value.result;
           if (result && result.kind === 'error') throw new Error(result.text || '执行失败');
-          return { matched: true, via: 'remote' };
+          return { matched: Boolean(value), via: 'remote' };
         }
         throw new Error(
           '会话命令通道不可用：binding.session.command 取不到。' +
@@ -485,27 +657,35 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Read the newest Host turn dump out of the client window.
+     * Read the Host turn dump written AFTER one request.
      *
      * The panel can only *send* commands — `session.command()` reports nothing
      * but `matched` — so a command's text comes back as the durable
      * `command/done` row. That row is the return channel; only a payload that
      * parses to `{ build, turns }` counts, so trim outcomes are skipped.
+     *
+     * `afterSeq` is the window tail captured BEFORE the request was sent. The
+     * window still holds the previous dump, so without that bound this function
+     * would answer every refresh with the pre-action answer.
+     *
+     * @returns `{ dump, seq }` for the newest qualifying row, or null.
      */
-    function readHostDump(snapshot) {
+    function readHostDump(snapshot, afterSeq) {
       const entries = snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : [];
       for (let i = entries.length - 1; i >= 0; i -= 1) {
         const entry = entries[i];
         if (!entry || entry.type !== 'event' || !entry.event) continue;
         const ev = entry.event;
         if (ev.type !== 'command/done') continue;
+        if (typeof ev.seq !== 'number') continue;
+        if (afterSeq !== null && ev.seq <= afterSeq) continue;
         const data = ev.data || {};
         if (data.kind !== 'success' || typeof data.text !== 'string') continue;
         const text = data.text.trim();
         if (text.charAt(0) !== '{') continue;
         try {
           const parsed = JSON.parse(text);
-          if (parsed && Array.isArray(parsed.turns)) return parsed;
+          if (parsed && Array.isArray(parsed.turns)) return { dump: parsed, seq: ev.seq };
         } catch { /* not the Host dump */ }
       }
       return null;
@@ -520,8 +700,8 @@ window.__ModuleLoader__.load({
      * against the Host's complete log, so one call lists every turn under its
      * real number, no matter how far the chat has been scrolled.
      */
-    /** Window tail seq per session: the cache key for the last Host dump. */
-    function windowHeadSeq(snapshot) {
+    /** Last event seq in the window; the cache key for the last Host dump. */
+    function windowTailSeq(snapshot) {
       const entries = snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : [];
       for (let i = entries.length - 1; i >= 0; i -= 1) {
         const entry = entries[i];
@@ -543,6 +723,10 @@ window.__ModuleLoader__.load({
       const { sessionId, enabled, refreshKey, getWindow, run } = params;
       const [state, setState] = React.useState({ status: 'idle', turns: null, build: null, error: '' });
       const busy = React.useRef(false);
+      /** Whether a forced refresh arrived while a load was in flight. */
+      const queued = React.useRef(false);
+      /** Stable handle on `load`, so its own tail can re-run it. */
+      const loadRef = React.useRef(null);
       const alive = React.useRef(true);
       const generation = React.useRef(0);
       // Held in refs so `load` stays identity-stable: the effect must fire on
@@ -567,8 +751,14 @@ window.__ModuleLoader__.load({
         setState({ status: 'idle', turns: null, build: null, error: '' });
       }, [sessionId]);
 
-      const load = React.useCallback(async () => {
-        if (busy.current) return;
+      const load = React.useCallback(async (force) => {
+        if (busy.current) {
+          // A forced refresh that arrives mid-flight (an action finishing while
+          // the first load runs) must not be dropped, or the panel settles on
+          // pre-action data.
+          if (force) queued.current = true;
+          return;
+        }
         busy.current = true;
         const mine = generation.current;
         const live = () => alive.current && generation.current === mine;
@@ -576,9 +766,9 @@ window.__ModuleLoader__.load({
         setState((prev) => (live() ? { ...prev, status: prev.turns ? 'refreshing' : 'loading', error: '' } : prev));
         try {
           const before = getWindowRef.current ? getWindowRef.current() : null;
-          const beforeHead = windowHeadSeq(before);
-          const cached = sessionKey ? hostTurnCache.get(sessionKey) : undefined;
-          if (cached && beforeHead !== null && cached.head === beforeHead) {
+          const beforeTail = windowTailSeq(before);
+          const cached = sessionKey && !force ? hostTurnCache.get(sessionKey) : undefined;
+          if (cached && beforeTail !== null && cached.head === beforeTail) {
             if (live()) {
               setState({ status: 'ready', turns: cached.turns, build: cached.build, error: '' });
             }
@@ -594,21 +784,27 @@ window.__ModuleLoader__.load({
             }));
             return;
           }
-          let dump = null;
+          let found = null;
           // The dump travels through the follow stream: it can land one frame
-          // after the RPC resolves, so poll the live window briefly.
-          for (let attempt = 0; attempt < 12 && dump === null; attempt += 1) {
-            dump = readHostDump(getWindowRef.current ? getWindowRef.current() : null);
-            if (dump === null) await new Promise((resolve) => setTimeout(resolve, 60));
+          // after the RPC resolves, so poll the live window briefly. Only a row
+          // written after `beforeTail` can answer THIS request.
+          for (let attempt = 0; attempt < 12 && found === null; attempt += 1) {
+            found = readHostDump(getWindowRef.current ? getWindowRef.current() : null, beforeTail);
+            if (found === null) await new Promise((resolve) => setTimeout(resolve, 60));
           }
           if (!live()) return;
-          if (dump === null) {
-            setState((prev) => ({ ...prev, status: 'error', error: '没读到 Host 返回的轮次数据' }));
+          if (found === null) {
+            setState((prev) => ({
+              ...prev,
+              status: 'error',
+              error: '没读到 Host 本次返回的轮次数据',
+            }));
             return;
           }
+          const dump = found.dump;
           const build = typeof dump.build === 'string' ? dump.build : null;
           if (sessionKey) {
-            const head = windowHeadSeq(getWindowRef.current ? getWindowRef.current() : null);
+            const head = windowTailSeq(getWindowRef.current ? getWindowRef.current() : null);
             hostTurnCache.set(sessionKey, { head, turns: dump.turns, build });
             if (hostTurnCache.size > 32) {
               hostTurnCache.delete(hostTurnCache.keys().next().value);
@@ -619,13 +815,29 @@ window.__ModuleLoader__.load({
           if (live()) setState((prev) => ({ ...prev, status: 'error', error: errText(err) }));
         } finally {
           busy.current = false;
+          if (queued.current) {
+            queued.current = false;
+            if (loadRef.current) void loadRef.current(true);
+          }
         }
       }, []);
+      loadRef.current = load;
+
+      const loadedKey = React.useRef(null);
+      React.useEffect(() => {
+        // A different session is a different question — never let the previous
+        // session's `refreshKey` suppress its first fetch.
+        loadedKey.current = null;
+      }, [sessionId]);
 
       React.useEffect(() => {
         if (!enabled) return;
-        void load();
-      }, [enabled, refreshKey, load]);
+        // Re-opening the panel reuses the cache; an explicit refresh (the 刷新
+        // button, or an action that just landed) always re-reads the Host.
+        const force = loadedKey.current !== null && loadedKey.current !== refreshKey;
+        loadedKey.current = refreshKey;
+        void load(force);
+      }, [enabled, refreshKey, sessionId, load]);
 
       return { state, reload: load };
     }
@@ -646,6 +858,7 @@ window.__ModuleLoader__.load({
         display: 'flex',
         alignItems: 'center',
         gap: '8px',
+        flexWrap: 'wrap',
         paddingBottom: '8px',
         borderBottom: '1px solid var(--dsw-alias-border-subtle, rgba(0,0,0,0.08))',
       },
@@ -782,13 +995,14 @@ window.__ModuleLoader__.load({
 
       const run = React.useMemo(() => makeRunner(ctx, sessionId), [ctx, sessionId]);
 
-      // The window is turn-aligned but starts at the tail: as long as it has
-      // more pages, its turn numbering is a suffix of the real conversation.
-      // Ask the Host (which holds the whole log) instead of guessing.
+      // The window is turn-aligned but starts at the tail. Always ask the Host
+      // (which holds the whole log) instead of guessing: it is the single source
+      // of turn numbering, and its build string is the only way to tell which
+      // Host half is actually loaded.
       const windowHasMore = Boolean(winState.window && winState.window.hasMore);
       const host = useHostTurns({
         sessionId,
-        enabled: winState.status === 'ready' && windowHasMore,
+        enabled: winState.status === 'ready',
         refreshKey: tick,
         getWindow: winState.getWindow,
         run,
@@ -797,51 +1011,36 @@ window.__ModuleLoader__.load({
       const turns = usingHost ? host.state.turns : built.turns;
 
       // A command reports only "matched", never its own outcome, so success is
-      // decided by observing the surface actually change. Turns are matched by
-      // the user message they start at, which survives both numbering schemes.
+      // decided by observing the surface actually change.
       const pendingRef = React.useRef(null);
+      /** Per-action token: a stale fallback timer must never settle a newer click. */
+      const actionSeq = React.useRef(0);
+      /** Newest rows for the timer, which closes over a stale render. */
+      const turnsRef = React.useRef(turns);
+      turnsRef.current = turns;
 
       React.useEffect(() => {
         const p = pendingRef.current;
         if (!p) return;
-        const now = turns.find((x) =>
-          p.userSeq !== null && x.userSeq !== null && x.userSeq !== undefined
-            ? x.userSeq === p.userSeq
-            : x.label === p.label,
-        );
-        if (!now) return;
-        const changed =
-          now.trimmed !== p.beforeTrimmed ||
-          now.deleted !== p.beforeDeleted ||
-          now.injectedStripped !== p.beforeStripped;
-        if (!changed) return;
+        const settled = settledFeedback(p, turns);
+        if (!settled) return;
         pendingRef.current = null;
-
-        if (p.action === 'strip_injected') {
-          setFeedback({
-            kind: 'ok',
-            text: `已清除第 ${p.label} 轮的系统注入上下文（${p.beforeInjected} 条）`,
-          });
-          return;
-        }
-        setFeedback({
-          kind: 'ok',
-          text:
-            (p.action === 'delete_turn' ? '已移除第 ' : '已修剪第 ') +
-            p.label +
-            ' 轮：工具调用 ' +
-            p.beforeTools +
-            ' → ' +
-            now.toolCalls +
-            (now.removedChars > 0 ? '，约移除 ' + fmtChars(now.removedChars) : ''),
-        });
+        setFeedback(settled);
       }, [turns]);
 
       async function act(action, t) {
+        if (t.removed) return;
         const isDelete = action === 'delete_turn';
         const isStrip = action === 'strip_injected';
         const tools = t.logToolCalls || t.toolCalls;
 
+        if (t.running) {
+          setFeedback({
+            kind: 'warn',
+            text: `第 ${t.label} 轮还在进行中（模型仍在生成）。等这一轮结束后再操作，否则本轮后续内容会落在标记之后。`,
+          });
+          return;
+        }
         if (!isDelete && !isStrip && tools === 0) {
           setFeedback({ kind: 'warn', text: `第 ${t.label} 轮没有工具调用，无需修剪。` });
           return;
@@ -874,12 +1073,14 @@ window.__ModuleLoader__.load({
         setFeedback(null);
         setManual(null);
         setBusy(true);
+        const actionId = actionSeq.current + 1;
+        actionSeq.current = actionId;
         pendingRef.current = {
+          id: actionId,
           label: t.label,
           userSeq: typeof t.userSeq === 'number' ? t.userSeq : null,
           action,
           beforeTrimmed: Boolean(t.trimmed),
-          beforeDeleted: Boolean(t.deleted),
           beforeStripped: Boolean(t.injectedStripped),
           beforeInjected: t.injectedCount || 0,
           beforeTools: tools,
@@ -908,8 +1109,16 @@ window.__ModuleLoader__.load({
         if (typeof setTimeout === 'function') {
           setTimeout(() => {
             const p = pendingRef.current;
-            if (!p || p.label !== t.label) return;
+            // A newer click owns the slot; a stale timer must not settle it.
+            if (!p || p.id !== actionId) return;
+            // Judge once more against the newest rows: the watcher may have
+            // missed a frame that arrived after its last render.
+            const settled = settledFeedback(p, turnsRef.current);
             pendingRef.current = null;
+            if (settled) {
+              setFeedback(settled);
+              return;
+            }
             setFeedback({
               kind: 'warn',
               text:
@@ -932,12 +1141,29 @@ window.__ModuleLoader__.load({
         }
 
         return turns.map((t) => {
-          const done = Boolean(t.trimmed || t.deleted);
+          if (t.removed) {
+            // A removal marker: the row keeps its number so the turns after it
+            // never appear to shift, but there is nothing left to act on.
+            return h('div', {
+              key: 'turn-' + t.label + '-' + t.startSeq,
+              style: { ...S.card, ...S.cardDone },
+            },
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+                h('strong', null, `第 ${t.label} 轮`),
+                h('span', { style: S.badgeDone }, '【已移除】'),
+                h('span', { style: { marginLeft: 'auto', ...S.note } }, `${t.nodeCount} 个节点`)
+              ),
+              h('div', { style: S.note }, '这一轮问答已从模型上下文中移除；原始日志仍完整保留。')
+            );
+          }
+
+          const done = Boolean(t.trimmed);
           const shown = t.logToolCalls == null ? t.toolCalls : t.logToolCalls;
           const hasTools = shown > 0;
           const toolLabel = hasTools ? `${shown} 次工具调用` : '无工具调用';
           const saved = t.removedChars > 0 ? ` · 已移除 ~${fmtChars(t.removedChars)}` : '';
           const hasInjected = (t.injectedCount || 0) > 0;
+          const blocked = busy || Boolean(t.running);
           return h('div', {
             key: 'turn-' + t.label + '-' + t.startSeq,
             style: done ? { ...S.card, ...S.cardDone } : S.card,
@@ -951,8 +1177,8 @@ window.__ModuleLoader__.load({
                 : null,
               t.injectedStripped ? h('span', { style: S.badgeDone }, '【注入已清】') : null,
               t.trimmed ? h('span', { style: S.badgeDone }, '【已修剪】' + saved) : null,
-              t.deleted ? h('span', { style: S.badgeDone }, '【已移除】') : null,
-              h('span', { style: { marginLeft: 'auto', ...S.note } }, `seq ${t.startSeq}–${t.endSeq}`)
+              t.running ? h('span', { style: S.badge }, '【进行中】') : null,
+              h('span', { style: { marginLeft: 'auto', ...S.note } }, `${t.nodeCount} 个节点`)
             ),
             t.user ? h('div', null, h('strong', null, '提问：'), previewText(t.user, 100)) : null,
             hasInjected
@@ -966,8 +1192,10 @@ window.__ModuleLoader__.load({
                     key: 'trim',
                     type: 'button',
                     style: S.btn,
-                    disabled: busy,
-                    title: '把本轮中间的工具调用与结果从模型上下文中移除，只保留提问与最终回答',
+                    disabled: blocked,
+                    title: t.running
+                      ? '这一轮还在进行中，结束后才能修剪'
+                      : '把本轮中间的工具调用与结果从模型上下文中移除，只保留提问与最终回答',
                     onClick: () => act('trim_tools', t),
                   }, '✂️ 只留问答')
                 : null,
@@ -976,7 +1204,7 @@ window.__ModuleLoader__.load({
                     key: 'strip',
                     type: 'button',
                     style: S.btn,
-                    disabled: busy,
+                    disabled: blocked,
                     title: '清除本轮的系统注入上下文（运行时快照、时间戳、技能清单等），保留你的提问',
                     onClick: () => act('strip_injected', t),
                   }, '🧽 清注入')
@@ -985,8 +1213,10 @@ window.__ModuleLoader__.load({
                 key: 'del',
                 type: 'button',
                 style: S.btnDanger,
-                disabled: busy,
-                title: '把本轮问答从模型上下文中移除',
+                disabled: blocked,
+                title: t.running
+                  ? '这一轮还在进行中，结束后才能删除'
+                  : '把本轮问答从模型上下文中移除',
                 onClick: () => act('delete_turn', t),
               }, '🗑 删除本轮')
             )
@@ -994,7 +1224,7 @@ window.__ModuleLoader__.load({
         });
       }
 
-      const doneCount = turns.filter((t) => t.trimmed || t.deleted).length;
+      const doneCount = turns.filter((t) => t.trimmed || t.removed).length;
       const savedChars = turns.reduce((sum, t) => sum + (t.removedChars || 0), 0);
 
       return h('div', { style: S.root },
@@ -1005,14 +1235,11 @@ window.__ModuleLoader__.load({
           usingHost
             ? h('span', {
                 style: S.badgeDone,
-                title:
-                  '来自 Host 的完整日志；与聊天区滚到哪无关（Host ' +
-                  (host.state.build || '?') +
-                  '）',
-              }, '全量')
+                title: '来自 Host 的完整日志；与聊天区滚到哪无关',
+              }, '全量 · ' + (host.state.build || '?'))
             : windowHasMore
               ? h('span', { style: S.badgeWarn, title: '只统计聊天区已加载的窗口，轮次编号是窗口内的' }, '窗口内')
-              : null,
+              : h('span', { style: S.badgeWarn, title: 'Host 轮次尚未返回，先显示本地窗口数据' }, '本地'),
           h('button', {
             type: 'button',
             style: { ...S.btn, marginLeft: 'auto' },
@@ -1023,14 +1250,12 @@ window.__ModuleLoader__.load({
         ),
         usingHost
           ? null
-          : windowHasMore
-            ? h('div', { style: S.note },
-                host.state.status === 'loading' || host.state.status === 'refreshing'
-                  ? '正在向 Host 读取完整轮次…'
-                  : '未能读到 Host 的完整轮次（' +
-                    (host.state.error || '尚未返回') +
-                    '），下面只列出聊天区已加载窗口内的轮次，编号从 1 起算。')
-            : null,
+          : h('div', { style: S.note },
+              host.state.status === 'error'
+                ? '未能读到 Host 的完整轮次（' +
+                  (host.state.error || '未返回') +
+                  '），下面只列出聊天区已加载窗口内的轮次。'
+                : '正在向 Host 读取完整轮次…'),
         doneCount > 0 || savedChars > 0
           ? h('div', { style: S.note },
               `已修剪 ${doneCount} 轮` +
@@ -1134,7 +1359,7 @@ window.__ModuleLoader__.load({
       }, h('span', { 'aria-hidden': 'true' }, '✂️'));
     }
 
-    return {
+    const plugin = {
       inject: ['slots', 'remote'],
       apply(ctx) {
         pluginCtx = ctx;
@@ -1284,5 +1509,13 @@ window.__ModuleLoader__.load({
         };
       },
     };
+
+    // Test-only hook (see test-synthetic.mjs): the bench compares the panel's
+    // own surface fold and its action-settling rule against the Host's answers.
+    // Never enabled by the runtime.
+    if (typeof window !== 'undefined' && window.__CONTEXT_TRIMMER_TEST__ === true) {
+      plugin.__test = { buildTurns, settledFeedback };
+    }
+    return plugin;
   },
 });

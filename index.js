@@ -10,11 +10,24 @@
  * those are NOT questions. They are grouped into the turn they precede, so they
  * can be cleared separately.
  *
+ * Everything below reasons in TWO coordinate systems, and keeping them apart is
+ * the whole point of this file:
+ *
+ *   - the LOG is `seq`-ordered and append-only;
+ *   - the SURFACE is position-ordered, and a replacement event carries a TAIL
+ *     seq yet sits in the MIDDLE of `session.surface.nodes`.
+ *
+ * So a surface range must never be bounded by comparing `seq` values. Ranges are
+ * computed as indices into `session.surface.nodes`, and only turned back into
+ * seqs at the two edges (`surfaceOp.startSeq` / `endSeq`). `sourceEventSeqs` is
+ * exactly the shadowed slice of that array — the harness's own contract, shared
+ * with `@deepseek-ai/dsh-compaction-basic`.
+ *
  * Actions:
  *   list            — human-readable report of the current surface.
  *   list_json       — the same data as JSON (the sidebar panel's source).
  *   trim_tools      — collapse a turn's assistant/tool span into one answer.
- *   delete_turn     — collapse a whole turn into a short placeholder.
+ *   delete_turn     — replace a whole turn with a removal marker.
  *   strip_injected  — drop a turn's injected context, keeping the question.
  */
 
@@ -26,22 +39,60 @@ export const inject = ['commands', 'sessions'];
  * running the code I just wrote?" stops being a guess — replacing an installed
  * package needs a process restart, and an unchanged number proves it.
  */
-const HOST_BUILD = 'b10-question-scope';
+const HOST_BUILD = 'b12-surface-index';
 
-const PLACEHOLDER = '（该轮对话已由用户手动修剪，内容已从上下文中移除）';
-const PLACEHOLDER_MARK = '已由用户手动修剪';
-const INJECTED_MARK = '已清除的系统注入上下文';
+/** Text the model reads where a trimmed turn had no answer worth keeping. */
+const TRIM_PLACEHOLDER = '（该轮的工具调用过程已由用户手动修剪，内容已从上下文中移除）';
 /** `source.kind` of a message this plugin wrote to replace tool chatter. */
 const TRIM_KIND = 'context-trimmer-summary';
-/** `source.kind` of a message this plugin wrote to blank a whole turn. */
+/** `source.kind` of a message this plugin wrote to stand in for a whole turn. */
 const DELETE_KIND = 'context-trimmer-removed';
 /** `source.kind` of a message this plugin wrote to blank injected context. */
 const INJECT_KIND = 'context-trimmer-stripped';
+
+/**
+ * The harness-injected `user/message` kinds this action may clear.
+ *
+ * Deliberately an allow-list. A `user/message` is not "a question" merely
+ * because its `source.kind` is not `'user'`: the same slot carries
+ * `compact-checkpoint` (the summary that replaced the whole earlier history),
+ * `user-question-reply` (the user's own answer to a question the agent asked),
+ * `goal`, `team-message`, `agent-message` and `agent-instructions`. Replacing
+ * any of those would delete content the user never asked to lose, so an unknown
+ * kind is left alone: invisible to this plugin is a safe default.
+ *
+ * Every entry below is something the harness `agent.inject()`ed as a notice —
+ * a snapshot, a timestamp, a catalog, a cwd notice — never typed text.
+ */
+const INJECTED_KINDS = new Set([
+  'runtime-context',
+  'time-context',
+  'skill-catalog',
+  'skill-invocation',
+  'model-selection',
+  'working-directory',
+  'user-approval',
+  'tmux-context',
+]);
 
 function surfaceNodes(session) {
   const surface = session && session.surface;
   const nodes = surface && surface.nodes;
   return Array.isArray(nodes) ? nodes.slice() : [];
+}
+
+/**
+ * The surface as positions plus a seq → position map.
+ *
+ * `nodes` is the single source of ordering for every range computed below.
+ */
+function surfaceIndex(session) {
+  const nodes = surfaceNodes(session);
+  const pos = new Map();
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (!pos.has(nodes[i])) pos.set(nodes[i], i);
+  }
+  return { nodes, pos };
 }
 
 function textOf(content) {
@@ -59,11 +110,18 @@ function textOf(content) {
   return '';
 }
 
-function textBlocks(content) {
+/**
+ * The visible answer blocks of one assistant message, ready to reuse.
+ *
+ * Only `text` blocks survive. The replacement is a `user/message`, and every
+ * adapter drops `reasoning` from user content — keeping it here would produce an
+ * empty message that the provider then skips, silently losing the answer.
+ */
+function answerBlocks(content) {
   if (!Array.isArray(content)) return [];
-  return content.filter(
-    (b) => b && (b.type === 'text' || b.type === 'reasoning') && typeof b.text === 'string',
-  );
+  return content
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string' && b.text.trim() !== '')
+    .map((b) => ({ type: 'text', text: b.text }));
 }
 
 function hasToolCallBlocks(content) {
@@ -98,12 +156,19 @@ function isOwnReplacement(ev) {
   );
 }
 
+/** The marker that stands where a removed turn used to be. */
+function isRemovedMarker(ev) {
+  if (!ev || ev.type !== 'user/message') return false;
+  const src = (ev.data || {}).source;
+  return Boolean(src) && src.kind === DELETE_KIND;
+}
+
 /** Context the harness injected, also stored as a user message. */
 function isInjected(ev) {
   if (!ev || ev.type !== 'user/message') return false;
   if (isOwnReplacement(ev)) return false;
   const src = (ev.data || {}).source;
-  return Boolean(src) && src.kind !== 'user';
+  return Boolean(src) && INJECTED_KINDS.has(src.kind);
 }
 
 function injectedKind(ev) {
@@ -112,15 +177,56 @@ function injectedKind(ev) {
 }
 
 /**
- * Group surface nodes into turns, split on REAL user messages.
+ * The number of the turn that is still open, or null when none is.
  *
- * Keying on an event's `turn` field cannot work: `user/message` carries no turn,
- * and every injected pseudo-message would become a turn of its own.
+ * A turn is open between its `turn/start` and its `turn/end`. Deleting or
+ * trimming an open turn would let the rest of that turn append *after* the
+ * replacement, so the removed content would come straight back.
+ */
+function openTurnNumber(session) {
+  if (!session || typeof session.ownEvents !== 'function') return null;
+  let open = null;
+  for (const ev of session.ownEvents()) {
+    if (ev.type === 'turn/start') {
+      open = typeof (ev.data || {}).turn === 'number' ? ev.data.turn : null;
+    } else if (ev.type === 'turn/end') {
+      open = null;
+    }
+  }
+  return open;
+}
+
+/**
+ * Group surface nodes into turns.
+ *
+ * Boundaries are real user messages and this plugin's removal markers. The
+ * marker is spliced where the question it replaced used to stand, so keeping it
+ * as a row of its own preserves every later label — the panel keeps showing
+ * "第 2 轮" for the row that was removed instead of renumbering the chat.
  */
 function groupTurns(session, nodes) {
   const groups = [];
   let current = null;
   let pending = [];
+
+  /** Start a row and adopt any context that preceded its boundary. */
+  function open(userSeq, removed) {
+    const group = {
+      assistantTurn: null,
+      userSeq,
+      removed,
+      seqs: [],
+      events: [],
+      injected: [],
+    };
+    for (const p of pending) {
+      group.seqs.push(p.seq);
+      group.events.push(p);
+      if (isInjected(p)) group.injected.push(p);
+    }
+    pending = [];
+    return group;
+  }
 
   for (const seq of nodes) {
     const ev = session.eventAt(seq);
@@ -130,17 +236,21 @@ function groupTurns(session, nodes) {
       continue;
     }
 
+    if (isRemovedMarker(ev)) {
+      const group = open(null, true);
+      group.seqs.push(seq);
+      group.events.push(ev);
+      groups.push(group);
+      current = null;
+      continue;
+    }
+
     if (isRealUser(ev)) {
-      current = { assistantTurn: null, userSeq: seq, seqs: [], events: [], injected: [] };
-      for (const p of pending) {
-        current.seqs.push(p.seq);
-        current.events.push(p);
-        if (isInjected(p)) current.injected.push(p);
-      }
-      pending = [];
-      current.seqs.push(seq);
-      current.events.push(ev);
-      groups.push(current);
+      const group = open(seq, false);
+      group.seqs.push(seq);
+      group.events.push(ev);
+      groups.push(group);
+      current = group;
       continue;
     }
 
@@ -159,25 +269,37 @@ function groupTurns(session, nodes) {
     }
   }
 
-  return groups.map((g, index) => ({
-    label: index + 1,
-    assistantTurn: g.assistantTurn,
-    userSeq: g.userSeq,
-    startSeq: g.seqs[0],
-    endSeq: g.seqs[g.seqs.length - 1],
-    seqs: g.seqs,
-    events: g.events,
-    injected: g.injected,
-  }));
+  const openTurn = openTurnNumber(session);
+  const lastLabel = groups.length;
+
+  return groups.map((g, index) => {
+    const running = !g.removed
+      && openTurn !== null
+      && index + 1 === lastLabel
+      && (g.assistantTurn === null || g.assistantTurn === openTurn);
+    return {
+      label: index + 1,
+      removed: g.removed,
+      running,
+      assistantTurn: g.assistantTurn,
+      userSeq: g.userSeq,
+      startSeq: g.seqs[0],
+      endSeq: g.seqs[g.seqs.length - 1],
+      seqs: g.seqs,
+      events: g.events,
+      injected: g.injected,
+    };
+  });
 }
 
 /**
  * The log range one question owns: `[this user message, the next one)`.
  *
- * The `turn` number cannot identify a question. It is the agent-loop turn, and
- * a message typed while a turn is still running joins THAT turn, so two
- * questions can share `turn: 1` and every per-turn tally then double-counts.
- * Real user messages are the only stable boundaries, and they survive a trim.
+ * The log is seq-ordered, so numeric bounds are correct HERE and only here.
+ * The `turn` number cannot identify a question: it is the agent-loop turn, and a
+ * message typed while a turn is still running joins THAT turn, so several
+ * questions can share `turn: 1`. Real user messages are the only stable
+ * boundaries, and they survive a trim.
  *
  * @returns the half-open seq range, or null when it cannot be bounded.
  */
@@ -199,34 +321,37 @@ function logRangeForUser(session, userSeq) {
   return { from: userSeq, to: next === null ? Number.POSITIVE_INFINITY : next };
 }
 
-/**
- * Whether a replacement this plugin wrote belongs to `group`.
- *
- * A `replace` shadows a range that starts inside the question it edits, but the
- * replacement event itself is appended at the log tail — so on the surface it
- * sits at the end of whichever group happens to be last. Attributing it by
- * position attributes every earlier question's trim to the newest one; the
- * replaced `startSeq` is the question's own identity.
- */
-function ownsReplacement(group, ev) {
-  const op = ev && ev.surfaceOp;
-  if (!op || typeof op !== 'object' || op.op !== 'replace') return false;
-  const start = Number(op.startSeq);
-  if (!Number.isFinite(start)) return false;
-  if (typeof group.userSeq === 'number' && start < group.userSeq) return false;
-  return start >= group.startSeq && start <= group.endSeq;
-}
-
 function describeTurn(group, session) {
+  if (group.removed) {
+    return {
+      turn: group.label,
+      label: group.label,
+      removed: true,
+      running: false,
+      trimmed: false,
+      startSeq: group.startSeq,
+      endSeq: group.endSeq,
+      nodeCount: group.seqs.length,
+      userSeq: null,
+      toolCalls: 0,
+      logToolCalls: 0,
+      removedChars: 0,
+      injectedCount: 0,
+      injectedKinds: [],
+      injectedChars: 0,
+      injectedStripped: false,
+      user: '',
+      assistant: '',
+    };
+  }
+
   let userText = '';
   let assistantText = '';
   let surfaceToolCalls = 0;
-  let deleted = false;
   let injectedChars = 0;
   let injectedStripped = false;
-  // Markers this plugin wrote during a previous trim/strip of this turn.
+  // A marker this plugin wrote during a previous trim of this turn.
   let trimMarked = false;
-  let deleteMarked = false;
   const kinds = [];
 
   for (const ev of group.events) {
@@ -234,15 +359,11 @@ function describeTurn(group, session) {
     if (isOwnReplacement(ev)) {
       const src = data.source || {};
       if (src.kind === TRIM_KIND) {
-        // A global replace lands at the log tail, so this group may hold the
-        // marker of a LATER question. Only the marker whose replaced range
-        // starts inside this group belongs here.
-        if (!ownsReplacement(group, ev)) continue;
+        // The marker is spliced where the span it replaced started, so being in
+        // this group already attributes it here; the replaced seqs only confirm.
         trimMarked = true;
         const t = previewOf(data.content, 160);
         if (t) assistantText = t;
-      } else if (src.kind === DELETE_KIND) {
-        deleteMarked = true;
       } else if (src.kind === INJECT_KIND) {
         injectedStripped = true;
       }
@@ -251,14 +372,8 @@ function describeTurn(group, session) {
     if (isRealUser(ev)) {
       const t = previewOf(data.content, 160);
       if (t) userText = t;
-      if (textOf(data.content).indexOf(PLACEHOLDER_MARK) >= 0) deleted = true;
     } else if (isInjected(ev)) {
-      const text = textOf(data.content);
-      if (text.indexOf(INJECTED_MARK) >= 0) {
-        injectedStripped = true;
-      } else {
-        injectedChars += text.length;
-      }
+      injectedChars += textOf(data.content).length;
       const k = injectedKind(ev);
       if (kinds.indexOf(k) === -1) kinds.push(k);
     } else if (ev.type === 'assistant/message') {
@@ -307,8 +422,11 @@ function describeTurn(group, session) {
   return {
     turn: group.label,
     label: group.label,
+    removed: false,
+    running: group.running,
     startSeq: group.startSeq,
     endSeq: group.endSeq,
+    nodeCount: group.seqs.length,
     userSeq: group.userSeq,
     toolCalls: surfaceToolCalls,
     logToolCalls,
@@ -318,7 +436,6 @@ function describeTurn(group, session) {
     // The marker is authoritative: after a trim the group's own seq range moves
     // to the replacement event, so the log-vs-surface gap alone cannot prove it.
     trimmed,
-    deleted: deleteMarked || deleted,
     injectedCount: group.injected.length,
     injectedKinds: kinds,
     injectedChars,
@@ -343,7 +460,7 @@ function answeredCallId(ev) {
 }
 
 /**
- * Grow a span until it never splits a tool call from its result.
+ * Grow a surface span until it never splits a tool call from its result.
  *
  * A provider rejects a request whose `assistant` message declares `tool_calls`
  * without the matching `tool` result, and equally rejects a `tool` result whose
@@ -353,73 +470,78 @@ function answeredCallId(ev) {
  * declaration behind.
  *
  * The expansion is bidirectional and re-checked until stable, because pulling
- * in one edge can expose another pairing.
+ * in one edge can expose another pairing. Everything here is a POSITION in
+ * `index.nodes`: a replacement event's seq says nothing about where it sits.
  *
- * @returns the closed span, or null when closing it would swallow a later
- *          question (that turn has to be trimmed differently, not corrupted).
+ * @param floorSeq - first node this span may occupy (the turn's own first node);
+ *          a pairing that would reach further back belongs to an earlier
+ *          question and must be refused, not folded in.
+ * @returns the closed span as `{ start, end }` indices, or null when closing it
+ *          would swallow a neighbouring question (which must be trimmed
+ *          differently, not corrupted).
  */
-function closeOverToolPairs(session, nodes, startSeq, endSeq, userSeq) {
-  if (!session || typeof session.eventAt !== 'function') return { startSeq, endSeq };
-  const onSurface = new Map();
-  for (const seq of nodes) {
-    const ev = session.eventAt(seq);
-    if (ev) onSurface.set(seq, ev);
-  }
+function closeOverToolPairs(session, index, startSeq, endSeq, userSeq, floorSeq) {
+  const { nodes, pos } = index;
+  let start = pos.get(startSeq);
+  let end = pos.get(endSeq);
+  if (start === undefined || end === undefined || start > end) return null;
 
-  const callAt = new Map(); // callId -> seq of the declaring assistant/message
-  const resultAt = new Map(); // callId -> seq of the answering tool/result
-  for (const [seq, ev] of onSurface) {
-    if (ev.type === 'assistant/message') {
-      for (const id of declaredCallIds(ev)) callAt.set(id, seq);
-    } else if (ev.type === 'tool/result') {
-      const id = answeredCallId(ev);
-      if (id !== null) resultAt.set(id, seq);
-    }
-  }
+  const floor = pos.get(floorSeq);
+  if (floor === undefined) return null;
 
   // The next real question bounds the span: crossing it would fold two
   // questions into one replacement and erase a message the user typed.
-  //
-  // Called through `session.` deliberately: these readers are class methods, and
-  // a detached reference loses `this` — `ownEvents()` would then read
-  // `this.snapshotEvents` off undefined and throw mid-command.
-  let limit = Number.POSITIVE_INFINITY;
-  if (typeof session.ownEvents === 'function' && typeof userSeq === 'number') {
-    for (const ev of session.ownEvents()) {
-      if (ev.type !== 'user/message' || typeof ev.seq !== 'number') continue;
-      if (!isRealUser(ev)) continue;
-      if (ev.seq > userSeq && ev.seq < limit) limit = ev.seq;
+  const userIdx = typeof userSeq === 'number' ? pos.get(userSeq) : undefined;
+  let limit = nodes.length;
+  if (userIdx !== undefined) {
+    for (let i = userIdx + 1; i < nodes.length; i += 1) {
+      if (isRealUser(session.eventAt(nodes[i]))) {
+        limit = i;
+        break;
+      }
     }
   }
 
-  let start = startSeq;
-  let end = endSeq;
-  for (let guard = 0; guard < 1000; guard += 1) {
+  const callAt = new Map(); // callId -> position of the declaring assistant/message
+  const resultAt = new Map(); // callId -> position of the answering tool/result
+  for (let i = 0; i < nodes.length; i += 1) {
+    const ev = session.eventAt(nodes[i]);
+    if (!ev) continue;
+    if (ev.type === 'assistant/message') {
+      for (const id of declaredCallIds(ev)) callAt.set(id, i);
+    } else if (ev.type === 'tool/result') {
+      const id = answeredCallId(ev);
+      if (id !== null) resultAt.set(id, i);
+    }
+  }
+
+  // Each pass either closes one more pair or stops; nodes.length is a safe cap.
+  for (let guard = 0; guard <= nodes.length; guard += 1) {
     let changed = false;
-    for (const [id, callSeq] of callAt) {
-      const resultSeq = resultAt.get(id);
-      if (resultSeq === undefined) continue;
-      if (callSeq >= start && callSeq <= end) {
-        if (resultSeq > end) {
-          end = resultSeq;
+    for (const [id, callIdx] of callAt) {
+      const resultIdx = resultAt.get(id);
+      if (resultIdx === undefined) continue;
+      if (callIdx >= start && callIdx <= end) {
+        if (resultIdx > end) {
+          end = resultIdx;
           changed = true;
         }
-        if (resultSeq < start) {
-          start = resultSeq;
+        if (resultIdx < start) {
+          start = resultIdx;
           changed = true;
         }
       }
     }
-    for (const [id, resultSeq] of resultAt) {
-      const callSeq = callAt.get(id);
-      if (callSeq === undefined) continue;
-      if (resultSeq >= start && resultSeq <= end) {
-        if (callSeq < start) {
-          start = callSeq;
+    for (const [id, resultIdx] of resultAt) {
+      const callIdx = callAt.get(id);
+      if (callIdx === undefined) continue;
+      if (resultIdx >= start && resultIdx <= end) {
+        if (callIdx < start) {
+          start = callIdx;
           changed = true;
         }
-        if (callSeq > end) {
-          end = callSeq;
+        if (callIdx > end) {
+          end = callIdx;
           changed = true;
         }
       }
@@ -428,7 +550,8 @@ function closeOverToolPairs(session, nodes, startSeq, endSeq, userSeq) {
   }
 
   if (end >= limit) return null;
-  return { startSeq: start, endSeq: end };
+  if (start < floor) return null;
+  return { start, end };
 }
 
 /** Pick the span that represents this turn's tool chatter. */
@@ -445,18 +568,11 @@ function toolSpanOf(group) {
   }
   if (startSeq === null) return null;
 
-  let endSeq = null;
-  for (const ev of group.events) {
-    if (ev.type === 'assistant/message') {
-      endSeq = ev.seq;
-    }
-  }
-  if (endSeq === null) endSeq = group.endSeq;
-  if (endSeq < startSeq) return null;
-  // The LAST surface node, not the last assistant: an assistant that declares
-  // tool calls is followed by its results, and stopping on it would orphan them.
-  if (group.endSeq > endSeq) endSeq = Math.max(endSeq, group.endSeq);
-  return { startSeq, endSeq };
+  // The span runs to the group's LAST surface node, not to its last assistant:
+  // an assistant that declares tool calls is followed by its results, and
+  // stopping on it would orphan them. `group.endSeq` is the last node by
+  // position, which is what the span needs; its seq value is irrelevant here.
+  return { startSeq, endSeq: group.endSeq };
 }
 
 function ok(text) {
@@ -468,7 +584,7 @@ function fail(text) {
 }
 
 function findTurn(session, nodes, payload) {
-  const groups = groupTurns(session, nodes);
+  const groups = groupTurns(session, nodes).filter((g) => !g.removed);
   if (groups.length === 0) return null;
 
   const raw = payload && payload.label !== undefined ? payload.label : payload && payload.turn;
@@ -491,45 +607,11 @@ function findTurn(session, nodes, payload) {
 }
 
 /**
- * Every event seq a replacement will shadow.
- *
- * The harness computes the shadowed set as a SLICE OF THE FULL EVENT RANGE
- * (`state.nodes.slice(startIdx, endIdx + 1)`), not of the surface message list.
- * That slice also contains `tool/call`, `step/*`, `job/*` and every other event
- * logged between the two edges; naming only the surface messages is rejected
- * with "sourceEventSeqs must include every shadowed surface node".
- *
- * So the cited list must be every event seq in [startSeq, endSeq], in order.
- */
-function shadowedSeqsOf(session, startSeq, endSeq) {
-  const list = [];
-  if (session && typeof session.snapshotEvents === 'function') {
-    const from = Number(startSeq);
-    const to = Number(endSeq);
-    // snapshotEvents(from, toExclusive) — walk the whole log once.
-    const events = session.snapshotEvents(0, session.seq);
-    for (const ev of events) {
-      if (typeof ev.seq !== 'number') continue;
-      if (ev.seq >= from && ev.seq <= to) list.push(ev.seq);
-    }
-  }
-  if (list.length === 0) {
-    // Fall back to the surface nodes of the same span.
-    const nodes = surfaceNodes(session);
-    const startIdx = nodes.indexOf(startSeq);
-    const endIdx = nodes.indexOf(endSeq);
-    if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return null;
-    return nodes.slice(startIdx, endIdx + 1);
-  }
-  return list;
-}
-
-/**
  * Whether a turn still has a tool call whose result never arrived.
  *
  * Trimming such a turn would leave an `assistant` message that declares
  * `tool_calls` with no matching `tool` message, which strict provider APIs
- * reject with 400. The turn is still running, so it is simply not trimmable yet.
+ * reject with 400.
  */
 function hasUnsettledToolCall(group) {
   const calls = new Map();
@@ -554,10 +636,22 @@ function hasUnsettledToolCall(group) {
   return null;
 }
 
+/** Shared refusal for a turn the agent is still writing into. */
+function refuseRunning(group, verb) {
+  return fail(
+    `第 ${group.label} 轮还在进行中（模型仍在生成），现在${verb}会让这一轮后续的内容` +
+      '落在标记之后，等于没有修剪。请等该轮结束后再操作。',
+  );
+}
+
 function trimTools(session, payload) {
-  const nodes = surfaceNodes(session);
-  const group = findTurn(session, nodes, payload);
+  const index = surfaceIndex(session);
+  const group = findTurn(session, index.nodes, payload);
   if (!group) return fail('没有找到要修剪的轮次（请点「刷新」后重试）。');
+  if (group.running) return refuseRunning(group, '修剪');
+
+  const raw = toolSpanOf(group);
+  if (!raw) return fail(`第 ${group.label} 轮没有可修剪的工具调用。`);
 
   const unsettled = hasUnsettledToolCall(group);
   if (unsettled) {
@@ -567,28 +661,42 @@ function trimTools(session, payload) {
     );
   }
 
-  const raw = toolSpanOf(group);
-  if (!raw) return fail(`第 ${group.label} 轮没有可修剪的工具调用。`);
-
   // Never cut a tool call away from its result: that is exactly the shape a
-  // provider rejects with "对话里的工具调用记录对不上".
-  const span = closeOverToolPairs(session, nodes, raw.startSeq, raw.endSeq, group.userSeq);
+  // provider rejects with "对话里的工具调用记录对不上". The floor keeps the span
+  // inside this question's own nodes, and the answer must stay after the
+  // question it answers.
+  const span = closeOverToolPairs(
+    session, index, raw.startSeq, raw.endSeq, group.userSeq, group.startSeq,
+  );
   if (!span) {
     return fail(
-      `第 ${group.label} 轮的工具调用跨越到下一个提问之后，单独修剪会让消息失去配对。` +
+      `第 ${group.label} 轮的工具调用跨越到相邻提问之外，单独修剪会让消息失去配对。` +
         '请改用「删除本轮」，或等该轮结束再修剪。',
     );
   }
 
-  const shadowed = shadowedSeqsOf(session, span.startSeq, span.endSeq);
-  if (!shadowed) return fail('要修剪的范围已不在当前表面上，请点「刷新」后重试。');
+  const userIdx = index.pos.get(group.userSeq);
+  if (userIdx !== undefined && span.start <= userIdx) {
+    return fail(
+      `第 ${group.label} 轮里有工具结果属于更早的提问（提问发出时上一轮还在运行），` +
+        '折叠它会把上一轮的调用声明一起卷进来。请等该轮结束后重试。',
+    );
+  }
+
+  // Every shadowed SURFACE node, in order — the harness validates exactly this
+  // slice (`surface.js`: `state.nodes.slice(startIdx, endIdx + 1)`), and citing
+  // log-only events instead both bloats the log and misses spliced markers.
+  const shadowed = index.nodes.slice(span.start, span.end + 1);
+  if (shadowed.length === 0) {
+    return fail('要修剪的范围已不在当前表面上，请点「刷新」后重试。');
+  }
 
   // The answer that survives is the LAST assistant message inside the closed
-  // span — not the last one in the group, which may now be outside it.
+  // span, by position — not the last one in the group, which may now be
+  // outside it, and not the one with the largest seq.
   let sourceMessage = null;
-  for (const seq of nodes) {
-    if (typeof seq !== 'number' || seq < span.startSeq || seq > span.endSeq) continue;
-    const ev = session.eventAt(seq);
+  for (let i = span.start; i <= span.end; i += 1) {
+    const ev = session.eventAt(index.nodes[i]);
     if (!ev || ev.type !== 'assistant/message') continue;
     const message = ev.data && ev.data.message;
     if (message) sourceMessage = message;
@@ -596,13 +704,13 @@ function trimTools(session, payload) {
   if (!sourceMessage) return fail('没有找到该轮最终的助手消息，无法安全替换。');
 
   // The answer text survives; the tool chatter does not.
-  const kept = textBlocks(sourceMessage.content);
-  const content = kept.length > 0 ? kept : [{ type: 'text', text: PLACEHOLDER }];
+  const kept = answerBlocks(sourceMessage.content);
+  const content = kept.length > 0 ? kept : [{ type: 'text', text: TRIM_PLACEHOLDER }];
 
-  // A replace MUST cite every shadowed node, but `assistant/message` may not
-  // carry `sourceEventSeqs` at all ("assistant/message embeds its source
-  // stream"). The replacement is therefore a user/message with its own
-  // source kind, exactly how DSH's own compaction writes its checkpoint.
+  // A replace MUST cite every shadowed surface node, but `assistant/message` may
+  // not carry `sourceEventSeqs` at all ("assistant/message embeds its source
+  // stream"). The replacement is therefore a user/message with its own source
+  // kind, exactly how DSH's own compaction writes its checkpoint.
   session.append(
     'user/message',
     // `id` is not optional: the harness treats a `user/message`'s `data` AS the
@@ -610,7 +718,7 @@ function trimTools(session, payload) {
     // message"), which makes the whole stored session unreadable on load.
     { id: globalThis.crypto.randomUUID(), role: 'user', content, source: { kind: TRIM_KIND } },
     {
-      surfaceOp: { op: 'replace', startSeq: span.startSeq, endSeq: span.endSeq },
+      surfaceOp: { op: 'replace', startSeq: index.nodes[span.start], endSeq: index.nodes[span.end] },
       sourceEventSeqs: shadowed,
     },
   );
@@ -621,24 +729,50 @@ function trimTools(session, payload) {
 }
 
 function deleteTurn(session, payload) {
-  const nodes = surfaceNodes(session);
-  const group = findTurn(session, nodes, payload);
+  const index = surfaceIndex(session);
+  const group = findTurn(session, index.nodes, payload);
   if (!group) return fail('没有找到要删除的轮次（请点「刷新」后重试）。');
+  if (group.running) return refuseRunning(group, '删除');
 
-  // A whole-turn removal also has to keep tool calls with their results; the
-  // group's own span can end on an assistant whose results sit just after it.
-  const span = closeOverToolPairs(session, nodes, group.startSeq, group.endSeq, group.userSeq);
-  if (!span) return fail('这一轮的工具调用与结果跨越了边界，删除会让配对断开，已拒绝。');
+  // A removal has to keep every tool call with its results too. The guard below
+  // runs before `closeOverToolPairs` so a half-open turn reports the real reason
+  // instead of "crosses the boundary".
+  const unsettled = hasUnsettledToolCall(group);
+  if (unsettled) {
+    return fail(
+      `第 ${group.label} 轮还有工具调用未返回结果（${unsettled.name}），现在删除会让` +
+        '随后返回的工具结果失去配对、无法发送。请等该轮结束后再删除。',
+    );
+  }
 
-  const shadowed = shadowedSeqsOf(session, span.startSeq, span.endSeq);
-  if (!shadowed) return fail('要删除的范围已不在当前表面上，请点「刷新」后重试。');
+  const span = closeOverToolPairs(
+    session, index, group.startSeq, group.endSeq, group.userSeq, group.startSeq,
+  );
+  if (!span) {
+    return fail(
+      '这一轮的工具调用与相邻轮次交错，删除会让配对断开或卷进上一个提问，已拒绝。' +
+        '请先修剪相邻轮次再试。',
+    );
+  }
 
-  const content = [{ type: 'text', text: `${PLACEHOLDER}（第 ${group.label} 轮）` }];
+  const shadowed = index.nodes.slice(span.start, span.end + 1);
+  if (shadowed.length === 0) {
+    return fail('要删除的范围已不在当前表面上，请点「刷新」后重试。');
+  }
+
   session.append(
     'user/message',
-    { id: globalThis.crypto.randomUUID(), role: 'user', content, source: { kind: DELETE_KIND } },
     {
-      surfaceOp: { op: 'replace', startSeq: span.startSeq, endSeq: span.endSeq },
+      id: globalThis.crypto.randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: `（原第 ${group.label} 轮问答已由用户手动移除，内容已从上下文中移除）` }],
+      // The marker keeps the identity of the row it stands for, so the panel can
+      // name it after the question itself is gone. It is never read as a
+      // question: `source.kind` is not `'user'`.
+      source: { kind: DELETE_KIND, userSeq: group.userSeq, label: group.label },
+    },
+    {
+      surfaceOp: { op: 'replace', startSeq: index.nodes[span.start], endSeq: index.nodes[span.end] },
       sourceEventSeqs: shadowed,
     },
   );
@@ -668,8 +802,8 @@ function injectedRuns(nodes, injected) {
 }
 
 function stripInjected(session, payload) {
-  const nodes = surfaceNodes(session);
-  const group = findTurn(session, nodes, payload);
+  const index = surfaceIndex(session);
+  const group = findTurn(session, index.nodes, payload);
   if (!group) return fail('没有找到该轮次（请点「刷新」后重试）。');
   if (group.injected.length === 0) return fail(`第 ${group.label} 轮没有系统注入上下文。`);
 
@@ -677,7 +811,7 @@ function stripInjected(session, payload) {
   // timestamp before the tools, a runtime snapshot after them). Each burst is
   // replaced on its own: one wide range would shadow the answers and tool
   // results between them, which the harness would then refuse.
-  const runs = injectedRuns(nodes, group.injected);
+  const runs = injectedRuns(index.nodes, group.injected);
   if (runs.length === 0) return fail('注入节点已不在当前表面上，请刷新后重试。');
 
   let cleared = 0;
@@ -686,15 +820,19 @@ function stripInjected(session, payload) {
   for (const run of runs) {
     const first = run[0];
     const last = run[run.length - 1];
-    const shadowed = shadowedSeqsOf(session, first.seq, last.seq);
-    if (!shadowed) return fail('注入范围已不在日志中，请刷新后重试。');
+    const start = index.pos.get(first.seq);
+    const end = index.pos.get(last.seq);
+    if (start === undefined || end === undefined || start > end) {
+      return fail('注入范围已不在当前表面上，请刷新后重试。');
+    }
+    const shadowed = index.nodes.slice(start, end + 1);
 
     session.append(
       'user/message',
       {
         id: globalThis.crypto.randomUUID(),
         role: 'user',
-        content: [{ type: 'text', text: `（${INJECTED_MARK}）` }],
+        content: [{ type: 'text', text: '（已清除的系统注入上下文）' }],
         source: { kind: INJECT_KIND },
       },
       {
@@ -719,13 +857,24 @@ function fmtChars(n) {
 }
 
 function rowLines(rows, nodes) {
-  const lines = [`共 ${rows.length} 轮真实提问（表面节点 ${nodes.length} 个）`, ''];
+  const live = rows.filter((r) => !r.removed).length;
+  const gone = rows.length - live;
+  const lines = [
+    `共 ${live} 轮真实提问${gone > 0 ? `（另有 ${gone} 轮已移除）` : ''}（表面节点 ${nodes.length} 个）`,
+    '',
+  ];
   for (const r of rows) {
-    const mark = r.deleted ? '【已移除】' : r.trimmed ? '【已修剪】' : '';
+    if (r.removed) {
+      lines.push(`第 ${r.label} 轮 · 【已移除】`);
+      lines.push('');
+      continue;
+    }
+    const mark = r.trimmed ? '【已修剪】' : '';
+    const running = r.running ? '【进行中】' : '';
     let tool = '无工具调用';
     if (r.logToolCalls > 0) {
       tool =
-        r.trimmed || r.deleted
+        r.trimmed
           ? `原 ${r.logToolCalls} 次工具调用 · 现 ${r.toolCalls} 次`
           : `${r.toolCalls} 次工具调用`;
     }
@@ -735,7 +884,7 @@ function rowLines(rows, nodes) {
           ? ' · 注入已清除'
           : ` · 注入 ${r.injectedCount} 条(${r.injectedKinds.join('/')}) ~${fmtChars(r.injectedChars)}`
         : '';
-    lines.push(`第 ${r.label} 轮 · ${tool}${inj} ${mark}`.trim());
+    lines.push(`第 ${r.label} 轮 · ${tool}${inj} ${mark}${running}`.trim());
     if (r.user) lines.push(`  问：${r.user}`);
     if (r.assistant) lines.push(`  答：${r.assistant}`);
     lines.push('');
