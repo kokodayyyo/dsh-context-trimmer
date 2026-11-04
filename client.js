@@ -1032,7 +1032,7 @@ window.__ModuleLoader__.load({
         if (t.removed) return;
         const isDelete = action === 'delete_turn';
         const isStrip = action === 'strip_injected';
-        const tools = t.logToolCalls || t.toolCalls;
+        const tools = Math.max(t.logToolCalls || 0, t.toolCalls || 0);
 
         if (t.running) {
           setFeedback({
@@ -1158,7 +1158,7 @@ window.__ModuleLoader__.load({
           }
 
           const done = Boolean(t.trimmed);
-          const shown = t.logToolCalls == null ? t.toolCalls : t.logToolCalls;
+          const shown = Math.max(t.logToolCalls || 0, t.toolCalls || 0);
           const hasTools = shown > 0;
           const toolLabel = hasTools ? `${shown} 次工具调用` : '无工具调用';
           const saved = t.removedChars > 0 ? ` · 已移除 ~${fmtChars(t.removedChars)}` : '';

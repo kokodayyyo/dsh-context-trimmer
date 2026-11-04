@@ -39,7 +39,7 @@ export const inject = ['commands', 'sessions'];
  * running the code I just wrote?" stops being a guess — replacing an installed
  * package needs a process restart, and an unchanged number proves it.
  */
-const HOST_BUILD = 'b12-surface-index';
+const HOST_BUILD = 'b13-fork-history';
 
 /** Text the model reads where a trimmed turn had no answer worth keeping. */
 const TRIM_PLACEHOLDER = '（该轮的工具调用过程已由用户手动修剪，内容已从上下文中移除）';
@@ -93,6 +93,27 @@ function surfaceIndex(session) {
     if (!pos.has(nodes[i])) pos.set(nodes[i], i);
   }
   return { nodes, pos };
+}
+
+/**
+ * The complete event log, inherited prefix included.
+ *
+ * `ownEvents()` deliberately skips a fork's copied prefix, but that prefix IS
+ * conversation the model still reads. A tally taken from `ownEvents()` reports
+ * zero tool calls for every question a fork inherited — which reads as "this
+ * turn has no tool calls" and hides the trim action entirely.
+ */
+function logEvents(session) {
+  if (!session) return [];
+  if (typeof session.snapshotEvents === 'function') {
+    try {
+      return session.snapshotEvents();
+    } catch {
+      /* fall through to the child-owned view */
+    }
+  }
+  if (typeof session.ownEvents === 'function') return session.ownEvents();
+  return [];
 }
 
 function textOf(content) {
@@ -183,10 +204,9 @@ function injectedKind(ev) {
  * trimming an open turn would let the rest of that turn append *after* the
  * replacement, so the removed content would come straight back.
  */
-function openTurnNumber(session) {
-  if (!session || typeof session.ownEvents !== 'function') return null;
+function openTurnNumber(log) {
   let open = null;
-  for (const ev of session.ownEvents()) {
+  for (const ev of log) {
     if (ev.type === 'turn/start') {
       open = typeof (ev.data || {}).turn === 'number' ? ev.data.turn : null;
     } else if (ev.type === 'turn/end') {
@@ -204,7 +224,7 @@ function openTurnNumber(session) {
  * as a row of its own preserves every later label — the panel keeps showing
  * "第 2 轮" for the row that was removed instead of renumbering the chat.
  */
-function groupTurns(session, nodes) {
+function groupTurns(session, nodes, log) {
   const groups = [];
   let current = null;
   let pending = [];
@@ -269,7 +289,7 @@ function groupTurns(session, nodes) {
     }
   }
 
-  const openTurn = openTurnNumber(session);
+  const openTurn = openTurnNumber(log);
   const lastLabel = groups.length;
 
   return groups.map((g, index) => {
@@ -303,12 +323,11 @@ function groupTurns(session, nodes) {
  *
  * @returns the half-open seq range, or null when it cannot be bounded.
  */
-function logRangeForUser(session, userSeq) {
+function logRangeForUser(log, userSeq) {
   if (typeof userSeq !== 'number') return null;
-  if (!session || typeof session.ownEvents !== 'function') return null;
   let next = null;
   let seen = false;
-  for (const ev of session.ownEvents()) {
+  for (const ev of log) {
     if (ev.type !== 'user/message' || typeof ev.seq !== 'number') continue;
     if (!isRealUser(ev)) continue;
     if (ev.seq === userSeq) {
@@ -321,7 +340,7 @@ function logRangeForUser(session, userSeq) {
   return { from: userSeq, to: next === null ? Number.POSITIVE_INFINITY : next };
 }
 
-function describeTurn(group, session) {
+function describeTurn(group, session, log) {
   if (group.removed) {
     return {
       turn: group.label,
@@ -395,9 +414,9 @@ function describeTurn(group, session) {
   // them (which reads as "everything is trimmed").
   let logToolCalls = 0;
   let logChars = 0;
-  const range = logRangeForUser(session, group.userSeq);
-  if (range && session && typeof session.ownEvents === 'function') {
-    for (const ev of session.ownEvents()) {
+  const range = logRangeForUser(log, group.userSeq);
+  if (range) {
+    for (const ev of log) {
       if (typeof ev.seq !== 'number' || ev.seq < range.from || ev.seq >= range.to) continue;
       const data = ev.data || {};
       if (ev.type === 'tool/call') {
@@ -583,8 +602,8 @@ function fail(text) {
   return { kind: 'error', text };
 }
 
-function findTurn(session, nodes, payload) {
-  const groups = groupTurns(session, nodes).filter((g) => !g.removed);
+function findTurn(session, nodes, payload, log) {
+  const groups = groupTurns(session, nodes, log).filter((g) => !g.removed);
   if (groups.length === 0) return null;
 
   const raw = payload && payload.label !== undefined ? payload.label : payload && payload.turn;
@@ -646,7 +665,7 @@ function refuseRunning(group, verb) {
 
 function trimTools(session, payload) {
   const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload);
+  const group = findTurn(session, index.nodes, payload, logEvents(session));
   if (!group) return fail('没有找到要修剪的轮次（请点「刷新」后重试）。');
   if (group.running) return refuseRunning(group, '修剪');
 
@@ -730,7 +749,7 @@ function trimTools(session, payload) {
 
 function deleteTurn(session, payload) {
   const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload);
+  const group = findTurn(session, index.nodes, payload, logEvents(session));
   if (!group) return fail('没有找到要删除的轮次（请点「刷新」后重试）。');
   if (group.running) return refuseRunning(group, '删除');
 
@@ -803,7 +822,7 @@ function injectedRuns(nodes, injected) {
 
 function stripInjected(session, payload) {
   const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload);
+  const group = findTurn(session, index.nodes, payload, logEvents(session));
   if (!group) return fail('没有找到该轮次（请点「刷新」后重试）。');
   if (group.injected.length === 0) return fail(`第 ${group.label} 轮没有系统注入上下文。`);
 
@@ -898,14 +917,16 @@ function rowLines(rows, nodes) {
 
 function listTurns(session) {
   const nodes = surfaceNodes(session);
-  const rows = groupTurns(session, nodes).map((g) => describeTurn(g, session));
+  const log = logEvents(session);
+  const rows = groupTurns(session, nodes, log).map((g) => describeTurn(g, session, log));
   if (rows.length === 0) return ok('当前会话还没有真实提问。');
   return ok(rowLines(rows, nodes));
 }
 
 function listTurnsJson(session) {
   const nodes = surfaceNodes(session);
-  const rows = groupTurns(session, nodes).map((g) => describeTurn(g, session));
+  const log = logEvents(session);
+  const rows = groupTurns(session, nodes, log).map((g) => describeTurn(g, session, log));
   // Returned as an object so the panel can show which Host build answered.
   return ok(JSON.stringify({ build: HOST_BUILD, turns: rows }));
 }

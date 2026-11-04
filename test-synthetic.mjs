@@ -33,7 +33,8 @@ const ROLE_BY_TYPE = {
 
 /** A faithful stand-in for the harness Session surface. */
 class FakeSession {
-  constructor(events) {
+  constructor(events, inherited = 0) {
+    this.inherited = inherited;
     this.log = events.slice();
     this.rebuild();
   }
@@ -60,7 +61,7 @@ class FakeSession {
   get surface() { return { nodes: this.nodes.slice() }; }
   get seq() { return this.log.length; }
   eventAt(seq) { return this.log[seq]; }
-  ownEvents() { return this.log.slice(); }
+  ownEvents() { return this.log.slice(this.inherited); }
   snapshotEvents(from = 0, toExclusive = this.seq) { return this.log.slice(from, toExclusive); }
 
   append(type, data, opts) {
@@ -507,6 +508,46 @@ await test('a question typed mid-run never drags the previous call into its span
     if (ev.type !== 'tool/result') continue;
     assert.ok(declared.has(ev.data.message.toolCallId), `seq ${seq}: orphan tool result`);
   }
+});
+
+await test('a fork keeps the tool tallies of the history it inherited', () => {
+  // A fork copies the parent prefix, marks the inherited cut, then owns whatever
+  // follows. `ownEvents()` skips that prefix, but the model still reads it — so
+  // the log tally must not report zero tool calls for inherited questions.
+  const parent = buildConversation();
+  const forked = new FakeSession([
+    ...parent,
+    { type: 'session/end-seed', seq: parent.length, data: { inherited: true } },
+  ], parent.length + 1);
+  forked.append('turn/start', { turn: 4 });
+  forked.append('user/message', {
+    id: 'fork-q', role: 'user', content: [{ type: 'text', text: 'Q4 新问题' }], source: { kind: 'user' },
+  }, { surfaceOp: 'append' });
+  forked.append('assistant/message', {
+    turn: 4, step: 1, stream: [],
+    message: { id: 'fork-a', role: 'assistant', content: [{ type: 'text', text: 'A4 新回答' }], source: { kind: 'model', provider: 'p', model: 'm' } },
+  }, { surfaceOp: 'append' });
+  forked.append('turn/end', { turn: 4, reason: { kind: 'stop' } });
+
+  let handler = null;
+  mod.apply({
+    commands: { register: (def) => { handler = def.handler; return () => {}; } },
+    sessions: { get: () => forked },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+  });
+  const run = (payload) => handler({ agent: { id: 's' }, rawInput: JSON.stringify(payload) });
+  const turns = JSON.parse(run({ action: 'list_json' }).text).turns;
+
+  assert.equal(turns.length, 4);
+  assert.deepEqual(turns.map((t) => t.toolCalls), [1, 1, 0, 0]);
+  assert.deepEqual(turns.map((t) => t.logToolCalls), [1, 1, 0, 0], 'inherited questions keep their tally');
+  assert.deepEqual(turns.map((t) => t.trimmed), [false, false, false, false]);
+
+  // An inherited question is still trimmable: its nodes are current surface.
+  const q1 = turns[0];
+  const res = run({ action: 'trim_tools', userSeq: q1.userSeq, startSeq: q1.startSeq, endSeq: q1.endSeq });
+  assert.equal(res.kind, 'success', res.text);
+  assert.equal(JSON.parse(run({ action: 'list_json' }).text).turns[0].trimmed, true);
 });
 
 /* --------------------------------------------------- client half smoke test */
