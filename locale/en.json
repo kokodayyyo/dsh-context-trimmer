@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Context Trimmer",
+    "description": "View and manually trim intermediate tool calls or messages from session context to save tokens and clean up conversation history."
+  }
+}
