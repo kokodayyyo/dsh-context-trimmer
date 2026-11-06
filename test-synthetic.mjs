@@ -37,6 +37,9 @@ class FakeSession {
     this.inherited = inherited;
     this.log = events.slice();
     this.rebuild();
+    this.openTurn = null;
+    this.compaction = null;
+    for (const ev of this.log) this.track(ev);
   }
 
   /** Fold the log exactly like `surface.js`: a replace splices IN PLACE. */
@@ -64,6 +67,84 @@ class FakeSession {
   ownEvents() { return this.log.slice(this.inherited); }
   snapshotEvents(from = 0, toExclusive = this.seq) { return this.log.slice(from, toExclusive); }
 
+  /** Track the turn / compaction cursors the real invariant derives from the log. */
+  track(ev) {
+    if (ev.type === 'turn/start') this.openTurn = ev.data.turn;
+    else if (ev.type === 'turn/end') this.openTurn = null;
+    else if (ev.type === 'compaction/start') {
+      this.compaction = {
+        id: ev.data.compactionId,
+        sourceCommandId: ev.data.sourceCommandId,
+        turn: ev.data.turn,
+        summarized: false,
+      };
+    } else if (ev.type === 'compaction/summary' && this.compaction) {
+      this.compaction.summarized = true;
+    } else if (ev.type === 'compaction/end' || ev.type === 'session/end-seed') {
+      this.compaction = null;
+    }
+  }
+
+  /**
+   * The compaction invariants `@deepseek-ai/dsh-compaction` enforces on every
+   * append (`dsh-compaction/lib/types/invariant.js`): brackets, ownership, and
+   * the exact shadowed surface span.
+   */
+  checkCompaction(type, data, opts) {
+    if ((type === 'turn/start' || type === 'turn/end') && this.compaction) {
+      throw new Error(`${type} crosses an open compaction`);
+    }
+    if (type === 'compaction/start') {
+      if (this.compaction) throw new Error('compaction/start overlaps an open compaction');
+      const turn = data.turn === undefined ? null : data.turn;
+      if (turn === null) {
+        if (this.openTurn !== null) throw new Error('standalone compaction with an open turn');
+      } else if (turn !== this.openTurn) {
+        throw new Error('compaction/start does not match the open turn');
+      }
+      return;
+    }
+    if (type === 'compaction/summary') {
+      if (!this.compaction) throw new Error('compaction/summary has no matching compaction/start');
+      if (data.compactionId !== this.compaction.id) throw new Error('compaction/summary id mismatch');
+      if (data.sourceCommandId !== this.compaction.sourceCommandId) throw new Error('compaction/summary sourceCommandId mismatch');
+      if (this.compaction.summarized) throw new Error('compaction/summary repeats');
+      const range = data.shadowedRange || {};
+      const start = this.nodes.indexOf(range.start);
+      const end = this.nodes.indexOf(range.end);
+      if (start < 0 || end < start) throw new Error('compaction/summary shadowedRange is not a current surface span');
+      const slice = this.nodes.slice(start, end + 1);
+      if (JSON.stringify(slice) !== JSON.stringify(data.shadowedSeqs)) {
+        throw new Error('compaction/summary shadowedSeqs must list every node in the current span');
+      }
+      if (!Number.isSafeInteger(data.shadowedTokenCount) || data.shadowedTokenCount < 0) {
+        throw new Error('compaction/summary shadowedTokenCount must be a non-negative integer');
+      }
+      return;
+    }
+    if (type === 'compaction/end') {
+      if (!this.compaction) throw new Error('compaction/end has no matching compaction/start');
+      if (data.compactionId !== this.compaction.id) throw new Error('compaction/end id mismatch');
+      if (data.turn !== this.compaction.turn) throw new Error('compaction/end changes its owner turn');
+      if (data.error === undefined && !this.compaction.summarized) {
+        throw new Error('successful compaction/end requires one summary');
+      }
+      return;
+    }
+    const source = data && data.source;
+    if (
+      SURFACE_TYPES.has(type) &&
+      source && source.kind === 'compact-checkpoint' &&
+      opts && opts.surfaceOp !== 'append'
+    ) {
+      if (!this.compaction) throw new Error('compaction checkpoint has no matching compaction/start');
+      if (source.compactionId !== this.compaction.id) throw new Error('compaction checkpoint id mismatch');
+      if (source.sourceCommandId !== this.compaction.sourceCommandId) {
+        throw new Error('compaction checkpoint sourceCommandId mismatch');
+      }
+    }
+  }
+
   append(type, data, opts) {
     const op = opts && opts.surfaceOp;
     const raw = opts && opts.sourceEventSeqs;
@@ -71,6 +152,8 @@ class FakeSession {
       throw new Error(`${type} is surface-eligible and requires a surfaceOp marker`);
     }
     const seq = this.log.length;
+
+    this.checkCompaction(type, data, opts);
 
     if (op !== undefined && op !== 'append') {
       if (op.startSeq >= seq || op.endSeq >= seq) {
@@ -121,6 +204,7 @@ class FakeSession {
     };
     this.log.push(ev);
     this.rebuild();
+    this.track(ev);
     return ev;
   }
 }
@@ -191,7 +275,7 @@ function buildConversation(opts = {}) {
   assistantCall('先看看文件', 'c1');
   toolCall('c1');
   toolResult('c1', 'FILE CONTENTS');
-  if (opts.injectedMidTurn) injected('mid-turn snapshot', 'runtime-context');
+  if (opts.injectedMidTurn) injected('mid-turn snapshot', 'time-context');
   assistantText('A1 回答一');
   turnEnd();
 
@@ -297,9 +381,10 @@ await test('list_json reports every question with its own tool calls', () => {
   assert.deepEqual(turns[0].injectedKinds, ['runtime-context']);
 });
 
-await test('trim_tools keeps the answer and cites exactly the shadowed surface nodes', () => {
+await test('trim_tools writes a complete compaction transaction over exactly the shadowed span', () => {
   const { session, act, dump } = bench();
   const before = session.surface.nodes.slice();
+  const baseSeq = session.log.length;
 
   const res = act('trim_tools', 1);
   assert.equal(res.kind, 'success', res.text);
@@ -310,24 +395,65 @@ await test('trim_tools keeps the answer and cites exactly the shadowed surface n
   assert.equal(turns[1].trimmed, false, 'the next question must be untouched');
   assert.equal(turns[1].toolCalls, 1);
 
-  const written = session.log.find((e) => e.data && e.data.source && e.data.source.kind === 'context-trimmer-summary');
-  assert.ok(written, 'a replacement must be written');
-  assert.equal(written.data.role, 'user');
-  assert.equal(typeof written.data.id, 'string');
-  assert.ok(written.data.id.length > 0);
-  assert.deepEqual(written.data.content, [{ type: 'text', text: 'A1 回答一' }]);
+  // start → summary → checkpoint → end, one identity throughout.
+  const written = session.log.slice(baseSeq);
+  assert.deepEqual(written.map((e) => e.type), [
+    'compaction/start', 'compaction/summary', 'user/message', 'compaction/end',
+  ]);
+  const [start, summary, checkpoint, end] = written;
+  const id = start.data.compactionId;
+  assert.equal(typeof id, 'string');
+  assert.equal(summary.data.compactionId, id);
+  assert.equal(checkpoint.data.source.compactionId, id);
+  assert.equal(checkpoint.data.source.kind, 'compact-checkpoint');
+  assert.equal(end.data.compactionId, id);
+  assert.equal(end.data.error, undefined);
+  assert.equal(start.data.turn, null, 'idle session → standalone bracket');
 
-  // The cited list must be the shadowed slice of the PRE-ACTION surface, and
-  // must not include log-only events such as `tool/call`.
-  const startIdx = before.indexOf(written.surfaceOp.startSeq);
-  const endIdx = before.indexOf(written.surfaceOp.endSeq);
+  // The summary must name the exact current surface span.
+  const startIdx = before.indexOf(summary.data.shadowedRange.start);
+  const endIdx = before.indexOf(summary.data.shadowedRange.end);
   assert.ok(startIdx >= 0 && endIdx >= startIdx, 'the span must name current surface nodes');
-  assert.deepEqual(written.sourceEventSeqs, before.slice(startIdx, endIdx + 1));
-  for (const seq of written.sourceEventSeqs) {
-    assert.ok(SURFACE_TYPES.has(session.eventAt(seq).type), `cited seq ${seq} is not a surface node`);
+  const shadowed = before.slice(startIdx, endIdx + 1);
+  assert.deepEqual(summary.data.shadowedSeqs, shadowed);
+  assert.ok(Number.isSafeInteger(summary.data.shadowedTokenCount) && summary.data.shadowedTokenCount >= 0);
+  assert.deepEqual(summary.data.trimmer.mode, 'trim');
+
+  // The checkpoint cites the shadowed nodes plus its two lifecycle seqs.
+  assert.deepEqual(checkpoint.sourceEventSeqs, [start.seq, summary.seq, ...shadowed]);
+
+  assert.equal(checkpoint.data.role, 'user');
+  assert.equal(typeof checkpoint.data.id, 'string');
+  assert.ok(checkpoint.data.id.length > 0);
+  assert.deepEqual(checkpoint.data.content, [{ type: 'text', text: 'A1 回答一' }]);
+
+  for (const seq of shadowed) {
+    assert.ok(SURFACE_TYPES.has(session.eventAt(seq).type), `shadowed seq ${seq} is not a surface node`);
   }
   assert.deepEqual(pairingProblems(session), []);
 });
+
+await test('a failed transaction closes its bracket with an error end-event', () => {
+  const { session, act } = bench();
+  // Make the checkpoint append itself fail: the bracket must not stay open.
+  const original = session.append.bind(session);
+  session.append = (type, data, opts) => {
+    if (type === 'user/message' && data && data.source && data.source.kind === 'compact-checkpoint') {
+      throw new Error('synthetic checkpoint failure');
+    }
+    return original(type, data, opts);
+  };
+  const res = act('trim_tools', 1);
+  assert.equal(res.kind, 'error');
+  assert.match(res.text, /synthetic checkpoint failure/);
+
+  const tail = session.log.slice(-2).map((e) => e.type);
+  assert.deepEqual(tail, ['compaction/summary', 'compaction/end']);
+  const end = session.log.at(-1);
+  assert.match(String(end.data.error), /synthetic checkpoint failure/);
+  assert.equal(session.compaction, null, 'the bracket must be closed');
+});
+
 
 await test('a trimmed turn can still be deleted (never refused because of a tail seq)', () => {
   const { session, act, dump, row } = bench();
@@ -380,16 +506,82 @@ await test('a deletion does not poison the neighbouring turn', () => {
   assert.deepEqual(pairingProblems(session), []);
 });
 
-await test('strip_injected leaves a marker that the next trim still cites', () => {
+await test('strip_injected clears only the ephemeral burst by default', () => {
   const { session, act, dump } = bench({ injectedMidTurn: true });
+  const before = dump()[0];
+  assert.equal(before.injectedEphemeral, 1);
+  assert.equal(before.injectedDurable, 1);
+
   const strip = act('strip_injected', 1);
   assert.equal(strip.kind, 'success', strip.text);
-  assert.equal(dump()[0].injectedStripped, true);
+  const after = dump()[0];
+  assert.equal(after.injectedEphemeral, 0, 'the time-context burst is gone');
+  assert.equal(after.injectedDurable, 1, 'the durable runtime snapshot stays');
+  assert.equal(after.injectedStripped, true);
 
   const res = act('trim_tools', 1);
   assert.equal(res.kind, 'success', res.text);
   assert.doesNotMatch(res.text, /missing/);
   assert.deepEqual(pairingProblems(session), []);
+});
+
+await test('durable carriers need an explicit second step', () => {
+  const { run, act, dump } = bench();
+  const row = dump()[0];
+  assert.equal(row.injectedDurable, 1);
+
+  const refused = run({
+    action: 'strip_injected', userSeq: row.userSeq, startSeq: row.startSeq, endSeq: row.endSeq,
+  });
+  assert.equal(refused.kind, 'error');
+  assert.match(refused.text, /持久注入/);
+
+  const forced = run({
+    action: 'strip_injected', userSeq: row.userSeq, startSeq: row.startSeq, endSeq: row.endSeq, includeDurable: true,
+  });
+  assert.equal(forced.kind, 'success', forced.text);
+  assert.equal(dump()[0].injectedCount, 0);
+});
+
+await test('an open compaction bracket blocks every write', () => {
+  const { session, act } = bench();
+  session.append('compaction/start', { compactionId: 'other', turn: null });
+  assert.equal(session.compaction.id, 'other');
+
+  const res = act('trim_tools', 1);
+  assert.equal(res.kind, 'error');
+  assert.match(res.text, /压缩事务/);
+  assert.equal(session.log.filter((e) => e.type === 'compaction/start').length, 1);
+});
+
+await test('a foreign compaction checkpoint is never shadowed', () => {
+  const { session, act } = bench();
+  // A real harness checkpoint (no `trimmer`) lands as its own transaction and
+  // replaces the head node of turn 1.
+  const start = session.append('compaction/start', { compactionId: 'real', turn: null });
+  const summary = session.append('compaction/summary', {
+    compactionId: 'real',
+    summary: [{ type: 'text', text: 'real summary' }],
+    shadowedRange: { start: 1, end: 1 },
+    shadowedSeqs: [1],
+    shadowedTokenCount: 1,
+  });
+  session.append('user/message', {
+    id: 'real-cp', role: 'user', content: [{ type: 'text', text: 'real summary' }],
+    source: { kind: 'compact-checkpoint', compactionId: 'real' },
+  }, {
+    surfaceOp: { op: 'replace', startSeq: 1, endSeq: 1 },
+    sourceEventSeqs: [start.seq, summary.seq, 1],
+  });
+  session.append('compaction/end', { compactionId: 'real', turn: null });
+
+  // The foreign checkpoint now stands at the head of turn 1; deleting that turn
+  // would shadow it, so the action must refuse.
+  const before = session.log.length;
+  const res = act('delete_turn', 1);
+  assert.equal(res.kind, 'error');
+  assert.match(res.text, /压缩检查点/);
+  assert.equal(session.log.length, before);
 });
 
 await test('a running turn refuses trim and delete, and the late result stays paired', () => {
@@ -618,6 +810,8 @@ await test('the panel folds the same surface as the Host, row for row', async ()
     logToolCalls: r.logToolCalls,
     removedChars: r.removedChars,
     injectedCount: r.injectedCount,
+    injectedEphemeral: r.injectedEphemeral,
+    injectedDurable: r.injectedDurable,
     injectedStripped: r.injectedStripped,
     user: r.user,
     assistant: r.assistant,
@@ -642,10 +836,14 @@ await test('the settle rule recognises a landed action and ignores an unchanged 
 
   const pendingStrip = {
     id: 1, label: 2, userSeq: 7, action: 'strip_injected',
-    beforeTrimmed: false, beforeStripped: false, beforeInjected: 1, beforeTools: 0,
+    beforeTrimmed: false, beforeInjected: 2, beforeTools: 0,
   };
-  assert.equal(settledFeedback(pendingStrip, [{ userSeq: 7, trimmed: false, injectedStripped: false }]), null);
-  assert.equal(settledFeedback(pendingStrip, [{ userSeq: 7, trimmed: false, injectedStripped: true }]).kind, 'ok');
+  // Unchanged count → still pending; the durable second step lands as a drop.
+  assert.equal(settledFeedback(pendingStrip, [{ userSeq: 7, injectedCount: 2, trimmed: false }]), null);
+  // The ephemeral step: 2 → 1.
+  assert.equal(settledFeedback(pendingStrip, [{ userSeq: 7, injectedCount: 1, trimmed: false }]).kind, 'ok');
+  // The durable step: 1 → 0.
+  assert.equal(settledFeedback(pendingStrip, [{ userSeq: 7, injectedCount: 0, trimmed: false }]).kind, 'ok');
 
   const pendingDelete = {
     id: 2, label: 2, userSeq: 7, action: 'delete_turn',
@@ -658,6 +856,168 @@ await test('the settle rule recognises a landed action and ignores an unchanged 
   );
   assert.equal(settledFeedback(pendingDelete, [{ label: 1, userSeq: 2 }]).kind, 'ok');
 });
+
+await test('buttons disappear exactly when the action has nothing left to do', async () => {
+  const plugin = await loadClientPlugin();
+  const { rowActions } = plugin.__test;
+
+  // The bug this locks: the log still holds 122 tool calls after a trim, so a
+  // log-based gate kept offering "trim" on an already-trimmed row.
+  const trimmed = rowActions({ trimmed: true, toolCalls: 0, logToolCalls: 122, injectedEphemeral: 0, injectedDurable: 0 });
+  assert.equal(trimmed.canTrim, false);
+  assert.equal(trimmed.canStrip, false);
+
+  const fresh = rowActions({ trimmed: false, toolCalls: 3, logToolCalls: 3, injectedEphemeral: 2, injectedDurable: 1 });
+  assert.equal(fresh.canTrim, true);
+  assert.equal(fresh.canStrip, true);
+  assert.equal(fresh.includeDurable, false, 'the ephemeral step comes first');
+
+  const durableOnly = rowActions({ trimmed: true, toolCalls: 0, injectedEphemeral: 0, injectedDurable: 1 });
+  assert.equal(durableOnly.canTrim, false);
+  assert.equal(durableOnly.canStrip, true);
+  assert.equal(durableOnly.includeDurable, true);
+
+  const running = rowActions({ running: true, toolCalls: 3, injectedEphemeral: 1 });
+  assert.equal(running.canTrim, false);
+  assert.equal(running.canStrip, false);
+
+  const removed = rowActions({ removed: true, toolCalls: 3, injectedEphemeral: 1 });
+  assert.equal(removed.canTrim, false);
+  assert.equal(removed.canStrip, false);
+});
+
+await test('two separate ephemeral bursts become two transactions, both valid', () => {
+  const session = new FakeSession([
+    { type: 'system/message', seq: 0, data: { message: { id: 's', role: 'system', content: [{ type: 'text', text: 'S' }], source: { kind: 'system-prompt' } } }, surfaceOp: 'append' },
+    { type: 'user/message', seq: 1, data: { id: 'i1', role: 'user', content: [{ type: 'text', text: 't1' }], source: { kind: 'time-context' } }, surfaceOp: 'append' },
+    { type: 'user/message', seq: 2, data: { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Q' }], source: { kind: 'user' } }, surfaceOp: 'append' },
+    { type: 'assistant/message', seq: 3, data: { turn: 1, step: 1, stream: [], message: { id: 'a3', role: 'assistant', content: [{ type: 'text', text: 'A' }], source: { kind: 'model', provider: 'p', model: 'm' } } }, surfaceOp: 'append' },
+    { type: 'user/message', seq: 4, data: { id: 'i4', role: 'user', content: [{ type: 'text', text: 't2' }], source: { kind: 'time-context' } }, surfaceOp: 'append' },
+    { type: 'assistant/message', seq: 5, data: { turn: 1, step: 1, stream: [], message: { id: 'a5', role: 'assistant', content: [{ type: 'text', text: 'B' }], source: { kind: 'model', provider: 'p', model: 'm' } } }, surfaceOp: 'append' },
+    { type: 'user/message', seq: 6, data: { id: 'u6', role: 'user', content: [{ type: 'text', text: 'Q2' }], source: { kind: 'user' } }, surfaceOp: 'append' },
+  ]);
+  let handler = null;
+  mod.apply({
+    commands: { register: (def) => { handler = def.handler; return () => {}; } },
+    sessions: { get: () => session },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+  });
+  const run = (payload) => handler({ agent: { id: 's' }, rawInput: JSON.stringify(payload) });
+  const before = JSON.parse(run({ action: 'list_json' }).text).turns[0];
+  assert.equal(before.injectedEphemeral, 2);
+
+  const beforeSeq = session.log.length;
+  const res = run({ action: 'strip_injected', userSeq: 2, startSeq: 1, endSeq: 5 });
+  assert.equal(res.kind, 'success', res.text);
+  const written = session.log.slice(beforeSeq).map((e) => e.type);
+  assert.deepEqual(written, [
+    'compaction/start', 'compaction/summary', 'user/message', 'compaction/end',
+    'compaction/start', 'compaction/summary', 'user/message', 'compaction/end',
+  ]);
+  assert.equal(session.compaction, null);
+  const after = JSON.parse(run({ action: 'list_json' }).text).turns[0];
+  assert.equal(after.injectedCount, 0);
+  assert.equal(after.injectedStripped, true);
+});
+
+await test('an assistant preview shows the answer, not the reasoning block', () => {
+  // Real shape: one assistant/message carries [reasoning, text]. `textOf` joins
+  // both, so a preview built from it would show the model's private reasoning.
+  const session = new FakeSession([
+    { type: 'system/message', seq: 0, data: { message: { id: 's', role: 'system', content: [{ type: 'text', text: 'S' }], source: { kind: 'system-prompt' } } }, surfaceOp: 'append' },
+    { type: 'user/message', seq: 1, data: { id: 'u1', role: 'user', content: [{ type: 'text', text: 'Q' }], source: { kind: 'user' } }, surfaceOp: 'append' },
+    {
+      type: 'assistant/message',
+      seq: 2,
+      data: {
+        turn: 1, step: 1, stream: [],
+        message: {
+          id: 'a2', role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'THINKING INTERNALS' },
+            { type: 'text', text: 'THE VISIBLE ANSWER' },
+            { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' },
+          ],
+          source: { kind: 'model', provider: 'p', model: 'm' },
+        },
+      },
+      surfaceOp: 'append',
+    },
+    { type: 'tool/call', seq: 3, data: { turn: 1, step: 1, callId: 'c1', name: 'read', arguments: '{}' } },
+    { type: 'tool/result', seq: 4, data: { message: { id: 'r4', role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'R' }], source: { kind: 'tool', callId: 'c1' } } }, surfaceOp: 'append' },
+  ]);
+  let handler = null;
+  mod.apply({
+    commands: { register: (def) => { handler = def.handler; return () => {}; } },
+    sessions: { get: () => session },
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+  });
+  const run = (payload) => handler({ agent: { id: 's' }, rawInput: JSON.stringify(payload) });
+  const row = JSON.parse(run({ action: 'list_json' }).text).turns[0];
+  assert.equal(row.assistant.includes('THINKING'), false, 'reasoning must not leak into the preview');
+  assert.ok(row.assistant.startsWith('THE VISIBLE ANSWER'), row.assistant);
+
+  // And the trim keeps exactly the text block.
+  const res = run({ action: 'trim_tools', userSeq: 1, startSeq: 2, endSeq: 4 });
+  assert.equal(res.kind, 'success', res.text);
+  const checkpoint = session.log.find((e) => e.type === 'user/message' && e.data.source.kind === 'compact-checkpoint');
+  assert.deepEqual(checkpoint.data.content, [{ type: 'text', text: 'THE VISIBLE ANSWER' }]);
+});
+/* ------------------------------------------------- real-session regression */
+// Opt-in: TRIMMER_LOG=<path to session.v4.jsonl.zstd> replays one real session
+// through the real Host half and performs a trim under the compaction
+// invariant. Skipped in CI, where no such file exists.
+const REAL_LOG = process.env.TRIMMER_LOG;
+if (REAL_LOG) {
+  await test('a real session survives a V2 trim under the compaction invariant', async () => {
+    const fs = await import('node:fs');
+    const zlib = await import('node:zlib');
+    const buf = fs.readFileSync(REAL_LOG);
+    const starts = [];
+    for (let i = 0; i + 4 <= buf.length; i += 1) {
+      if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i);
+    }
+    let text = '';
+    for (let k = 0; k < starts.length; k += 1) {
+      const s = starts[k];
+      const e = k + 1 < starts.length ? starts[k + 1] : buf.length;
+      try { text += zlib.zstdDecompressSync(buf.subarray(s, e)).toString('utf8'); } catch { /* torn frame */ }
+    }
+    const events = text.split('\n').filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((row) => row && typeof row.seq === 'number');
+    const seed = events.find((e) => e.type === 'session/end-seed' && e.data && e.data.inherited === true);
+    const session = new FakeSession(events, seed ? seed.seq : 0);
+
+    let handler = null;
+    mod.apply({
+      commands: { register: (def) => { handler = def.handler; return () => {}; } },
+      sessions: { get: () => session },
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+    });
+    const run = (payload) => handler({ agent: { id: 'real' }, rawInput: JSON.stringify(payload) });
+    const rows = JSON.parse(run({ action: 'list_json' }).text).turns;
+    assert.ok(rows.length > 0, 'the session must have at least one turn');
+
+    const target = rows.find((row) => !row.removed && !row.running && !row.trimmed && row.toolCalls > 0);
+    if (target === undefined) return;
+    const before = session.log.length;
+    const res = run({
+      action: 'trim_tools',
+      userSeq: target.userSeq,
+      startSeq: target.startSeq,
+      endSeq: target.endSeq,
+    });
+    assert.equal(res.kind, 'success', res.text);
+    const written = session.log.slice(before).map((e) => e.type);
+    assert.deepEqual(written, ['compaction/start', 'compaction/summary', 'user/message', 'compaction/end']);
+    assert.equal(session.compaction, null);
+    const after = JSON.parse(run({ action: 'list_json' }).text).turns
+      .find((row) => row.userSeq === target.userSeq);
+    assert.equal(after.trimmed, true);
+    assert.equal(after.toolCalls, 0);
+  });
+}
 
 /* ---------------------------------------------------------------- summary */
 

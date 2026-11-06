@@ -76,16 +76,19 @@ window.__ModuleLoader__.load({
       if (pending.userSeq === null) return null;
       const now = turns.find((x) => x.userSeq === pending.userSeq);
       if (!now) return null;
-      if (
-        now.trimmed === pending.beforeTrimmed &&
-        now.injectedStripped === pending.beforeStripped
-      ) {
-        return null;
-      }
+      // A strip can leave durable carriers behind (the second, explicit step),
+      // so it settles on a DROP IN COUNT — not on a one-shot flag.
+      const changed = pending.action === 'strip_injected'
+        ? (now.injectedCount || 0) < pending.beforeInjected
+        : now.trimmed !== pending.beforeTrimmed;
+      if (!changed) return null;
       if (pending.action === 'strip_injected') {
+        const left = now.injectedCount || 0;
+        const cleared = Math.max(0, pending.beforeInjected - left);
         return {
           kind: 'ok',
-          text: `已清除第 ${pending.label} 轮的系统注入上下文（${pending.beforeInjected} 条）`,
+          text: `已清除第 ${pending.label} 轮的 ${cleared} 条注入上下文` +
+            (left > 0 ? `（还剩 ${left} 条持久注入，需要时再执行一次）` : ''),
         };
       }
       return {
@@ -115,6 +118,30 @@ window.__ModuleLoader__.load({
       return str.length > limit ? str.slice(0, limit) + '…' : str;
     }
 
+    /**
+     * What this row can still do.
+     *
+     * Actionability is a SURFACE property: the log keeps the tool calls a trim
+     * removed, so a log-based count would keep offering "trim" on an
+     * already-trimmed row forever. Shared by the buttons and the confirm text so
+     * the two can never disagree.
+     */
+    function rowActions(t) {
+      const tools = t.toolCalls || 0;
+      const ephemeral = t.injectedEphemeral || 0;
+      const durable = t.injectedDurable || 0;
+      const live = !t.removed && !t.running;
+      return {
+        tools,
+        ephemeral,
+        durable,
+        canTrim: live && !t.trimmed && tools > 0,
+        canStrip: live && (ephemeral > 0 || durable > 0),
+        // Durable carriers are cleared in their own, explicitly confirmed step.
+        includeDurable: ephemeral === 0 && durable > 0,
+      };
+    }
+
     function textOf(content) {
       if (content == null) return '';
       if (typeof content === 'string') return content;
@@ -127,6 +154,25 @@ window.__ModuleLoader__.load({
 
     function hasToolCallBlocks(content) {
       return Array.isArray(content) && content.some(b => b && b.type === 'tool-call');
+    }
+
+    /**
+     * The visible answer text of one assistant message.
+     *
+     * Assistant content interleaves `reasoning` and `text` blocks, and
+     * `previewText` joins every block's text — so the first thing it returns is
+     * the model's private reasoning. A preview must show the answer instead.
+     */
+    function answerPreview(content, maxLen) {
+      const limit = typeof maxLen === 'number' ? maxLen : 90;
+      if (!Array.isArray(content)) return '';
+      const str = content
+        .filter(b => b && b.type === 'text' && typeof b.text === 'string')
+        .map(b => b.text)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return str.length > limit ? str.slice(0, limit) + '…' : str;
     }
 
     /**
@@ -187,25 +233,33 @@ window.__ModuleLoader__.load({
       return out;
     }
 
-    // The three `source.kind` values this plugin writes when it replaces content.
-    const TRIM_KIND = 'context-trimmer-summary';
-    const DELETE_KIND = 'context-trimmer-removed';
-    const INJECT_KIND = 'context-trimmer-stripped';
+    // The `source.kind` of every replacement node: the harness's own compaction
+    // checkpoint. The three legacy kinds are still recognized for sessions
+    // trimmed by an older install, and are never written again.
+    const COMPACT_KIND = 'compact-checkpoint';
+    const TRIM_MODE = 'trim';
+    const REMOVE_MODE = 'remove';
+    const STRIP_MODE = 'strip';
+    const LEGACY_TRIM_KIND = 'context-trimmer-summary';
+    const LEGACY_DELETE_KIND = 'context-trimmer-removed';
+    const LEGACY_INJECT_KIND = 'context-trimmer-stripped';
 
     /**
-     * The harness-injected kinds this panel may offer to clear.
+     * Injected kinds this panel offers to clear, split by durability.
      *
      * An allow-list on purpose: a `user/message` is not "injected context" just
      * because its kind is not `'user'`. The same slot carries
-     * `compact-checkpoint` (the summary that replaced the earlier history),
-     * `user-question-reply` (the user's own answer), `goal`, `team-message`,
-     * `agent-message` and `agent-instructions`; offering to clear those would
-     * delete content the user never asked to lose. Every entry here is an
-     * `agent.inject()` notice, never typed text.
+     * `compact-checkpoint`, `user-question-reply`, `goal`, `team-message`,
+     * `agent-message` and `agent-instructions`; clearing those would delete
+     * content the user never asked to lose.
+     *
+     * The split matters: the host only re-injects a DURABLE carrier when its
+     * content or state CHANGES, so clearing one can remove that guidance for the
+     * rest of the session. Only `time-context` is re-emitted every turn.
      */
-    const INJECTED_KINDS = new Set([
+    const EPHEMERAL_INJECTED = new Set(['time-context']);
+    const DURABLE_INJECTED = new Set([
       'runtime-context',
-      'time-context',
       'skill-catalog',
       'skill-invocation',
       'model-selection',
@@ -214,35 +268,79 @@ window.__ModuleLoader__.load({
       'tmux-context',
     ]);
 
-    function isOwnReplacement(ev) {
+    function isInjectedKind(kind) {
+      return EPHEMERAL_INJECTED.has(kind) || DURABLE_INJECTED.has(kind);
+    }
+
+    /**
+     * `compactionId` → the `trimmer` metadata this plugin wrote on the summary.
+     *
+     * A real compaction checkpoint has no `trimmer`, which is exactly how the
+     * panel tells "the user trimmed this" from "the harness compacted this".
+     */
+    function trimmerIndex(entries) {
+      const byId = new Map();
+      for (const entry of Array.isArray(entries) ? entries : []) {
+        if (!entry || entry.type !== 'event' || !entry.event) continue;
+        const ev = entry.event;
+        if (ev.type !== 'compaction/summary') continue;
+        const data = ev.data || {};
+        if (data.trimmer === undefined || typeof data.compactionId !== 'string') continue;
+        byId.set(data.compactionId, data.trimmer);
+      }
+      return byId;
+    }
+
+    /** Our metadata for one checkpoint node, when this plugin wrote it. */
+    function checkpointMeta(ev, trims) {
+      if (!ev || ev.type !== 'user/message') return undefined;
+      const src = (ev.data || {}).source;
+      if (!src || src.kind !== COMPACT_KIND || typeof src.compactionId !== 'string') return undefined;
+      const meta = trims && trims.get(src.compactionId);
+      return meta && typeof meta === 'object' ? meta : undefined;
+    }
+
+    /** A replacement written by the pre-checkpoint build. */
+    function isLegacyReplacement(ev) {
       if (!ev || ev.type !== 'user/message') return false;
       const src = (ev.data || {}).source;
       return Boolean(src) && (
-        src.kind === TRIM_KIND || src.kind === DELETE_KIND || src.kind === INJECT_KIND
+        src.kind === LEGACY_TRIM_KIND ||
+        src.kind === LEGACY_DELETE_KIND ||
+        src.kind === LEGACY_INJECT_KIND
       );
     }
 
     /** The marker that stands where a removed turn used to be. */
-    function isRemovedMarker(ev) {
+    function isRemovedMarker(ev, trims) {
       if (!ev || ev.type !== 'user/message') return false;
       const src = (ev.data || {}).source;
-      return Boolean(src) && src.kind === DELETE_KIND;
+      if (src && src.kind === LEGACY_DELETE_KIND) return true;
+      if (!src || src.kind !== COMPACT_KIND) return false;
+      const meta = checkpointMeta(ev, trims);
+      if (meta) return meta.mode === REMOVE_MODE;
+      // A paginated window can hold the checkpoint but not its summary event.
+      // The removal text is unique to this plugin, so it is a safe fallback.
+      return textOf((ev.data || {}).content).trimStart().startsWith('（原第');
     }
 
     /** A message the human typed; a user/message of any other kind is not one. */
     function isRealUserEvent(ev) {
       if (!ev || ev.type !== 'user/message') return false;
-      if (isOwnReplacement(ev)) return false;
+      if (isLegacyReplacement(ev)) return false;
       const src = (ev.data || {}).source;
+      // Every replacement kind — checkpoint included — stands in for content a
+      // turn already had, so it never opens a turn.
+      if (src && src.kind === COMPACT_KIND) return false;
       return !src || src.kind === 'user';
     }
 
     /** Harness injection this panel may show (and offer to clear). */
     function isInjectedEvent(ev) {
       if (!ev || ev.type !== 'user/message') return false;
-      if (isOwnReplacement(ev)) return false;
+      if (isLegacyReplacement(ev)) return false;
       const src = (ev.data || {}).source;
-      return Boolean(src) && INJECTED_KINDS.has(src.kind);
+      return Boolean(src) && isInjectedKind(src.kind);
     }
 
     function injectedKindOf(ev) {
@@ -259,6 +357,7 @@ window.__ModuleLoader__.load({
      */
     function buildTurns(entries) {
       const surface = surfaceEvents(entries);
+      const trims = trimmerIndex(entries);
       const groups = [];
       let current = null;
       let pending = [];
@@ -276,6 +375,8 @@ window.__ModuleLoader__.load({
           toolCalls: 0,
           injected: [],
           injectedChars: 0,
+          injectedEphemeral: 0,
+          injectedDurable: 0,
           injectedStripped: false,
         };
       }
@@ -296,8 +397,11 @@ window.__ModuleLoader__.load({
           row.lastSeq = p.seq;
           row.nodes += 1;
           if (isInjectedEvent(p)) {
-            row.injected.push(injectedKindOf(p));
+            const kind = injectedKindOf(p);
+            row.injected.push(kind);
             row.injectedChars += textOf((p.data || {}).content).length;
+            if (EPHEMERAL_INJECTED.has(kind)) row.injectedEphemeral += 1;
+            else row.injectedDurable += 1;
           }
         }
         pending = [];
@@ -308,9 +412,9 @@ window.__ModuleLoader__.load({
         const type = ev.type;
         if (type !== 'user/message' && type !== 'assistant/message' && type !== 'tool/result') continue;
 
-        // A removal marker is a row of its own: it stands where the removed
+        // A removal checkpoint is a row of its own: it stands where the removed
         // question used to be, so every later label keeps its number.
-        if (isRemovedMarker(ev)) {
+        if (isRemovedMarker(ev, trims)) {
           const row = open(ev.seq, null, true);
           row.lastSeq = ev.seq;
           groups.push(row);
@@ -336,21 +440,38 @@ window.__ModuleLoader__.load({
           current.lastSeq = ev.seq;
           current.nodes += 1;
 
-          // Our own trim/strip markers carry the outcome, keyed by source kind.
+          // A checkpoint this plugin wrote: `trimmer.mode` says which action.
+          const meta = checkpointMeta(ev, trims);
+          if (meta) {
+            if (meta.mode === TRIM_MODE) {
+              current.trimmedMarker = true;
+              const t = previewText((ev.data || {}).content, 160);
+              if (t) current.assistant = t;
+            } else if (meta.mode === STRIP_MODE) {
+              current.injectedStripped = true;
+            }
+            continue;
+          }
+
+          // Pre-checkpoint markers, still recognized.
           const src = (ev.data || {}).source || {};
-          if (src.kind === INJECT_KIND) {
+          if (src.kind === LEGACY_INJECT_KIND) {
             current.injectedStripped = true;
             continue;
           }
-          if (src.kind === TRIM_KIND) {
+          if (src.kind === LEGACY_TRIM_KIND) {
             current.trimmedMarker = true;
             const t = previewText((ev.data || {}).content, 160);
             if (t) current.assistant = t;
             continue;
           }
+
           if (isInjectedEvent(ev)) {
-            current.injected.push(injectedKindOf(ev));
+            const kind = injectedKindOf(ev);
+            current.injected.push(kind);
             current.injectedChars += textOf((ev.data || {}).content).length;
+            if (EPHEMERAL_INJECTED.has(kind)) current.injectedEphemeral += 1;
+            else current.injectedDurable += 1;
           }
           continue;
         }
@@ -371,7 +492,7 @@ window.__ModuleLoader__.load({
           if (current.assistantTurn === null && typeof data.turn === 'number') {
             current.assistantTurn = data.turn;
           }
-          const t = previewText(content, 160);
+          const t = answerPreview(content, 160);
           if (t) current.assistant = t;
         }
       }
@@ -477,6 +598,8 @@ window.__ModuleLoader__.load({
             injectedCount: 0,
             injectedKinds: [],
             injectedChars: 0,
+            injectedEphemeral: 0,
+            injectedDurable: 0,
             injectedStripped: false,
             user: '',
             assistant: '',
@@ -508,6 +631,8 @@ window.__ModuleLoader__.load({
           injectedCount: g.injected.length,
           injectedKinds: g.injected,
           injectedChars: g.injectedChars,
+          injectedEphemeral: g.injectedEphemeral,
+          injectedDurable: g.injectedDurable,
           injectedStripped: g.injectedStripped,
           user: g.user,
           assistant: g.assistant,
@@ -1032,7 +1157,11 @@ window.__ModuleLoader__.load({
         if (t.removed) return;
         const isDelete = action === 'delete_turn';
         const isStrip = action === 'strip_injected';
-        const tools = Math.max(t.logToolCalls || 0, t.toolCalls || 0);
+        const actions = rowActions(t);
+        const tools = actions.tools;
+        const ephemeral = actions.ephemeral;
+        const durable = actions.durable;
+        const includeDurable = isStrip && actions.includeDurable;
 
         if (t.running) {
           setFeedback({
@@ -1042,18 +1171,30 @@ window.__ModuleLoader__.load({
           return;
         }
         if (!isDelete && !isStrip && tools === 0) {
-          setFeedback({ kind: 'warn', text: `第 ${t.label} 轮没有工具调用，无需修剪。` });
+          setFeedback({
+            kind: 'warn',
+            text: t.trimmed
+              ? `第 ${t.label} 轮的工具调用已经修剪过了。`
+              : `第 ${t.label} 轮没有工具调用，无需修剪。`,
+          });
           return;
         }
-        if (isStrip && !(t.injectedCount > 0)) {
+        if (isStrip && ephemeral === 0 && durable === 0) {
           setFeedback({ kind: 'warn', text: `第 ${t.label} 轮没有系统注入上下文。` });
           return;
         }
 
         let question;
-        if (isDelete) question = `把第 ${t.label} 轮问答整轮从上下文移除？`;
-        else if (isStrip) question = `清除第 ${t.label} 轮的 ${t.injectedCount} 条系统注入上下文（运行时快照/时间戳/技能清单等），保留你的提问？`;
-        else question = `把第 ${t.label} 轮中间的 ${tools} 次工具调用与结果从上下文移除，只保留提问与最终回答？`;
+        if (isDelete) {
+          question = `把第 ${t.label} 轮问答整轮从上下文移除？`;
+        } else if (isStrip) {
+          question = includeDurable
+            ? `清除第 ${t.label} 轮的 ${durable} 条持久注入（${(t.injectedKinds || []).join('、')}）？\n\n` +
+              '注意：宿主只在这些内容变化时才会重发，清除后本次会话将不再携带这段说明。'
+            : `清除第 ${t.label} 轮的 ${ephemeral} 条瞬时注入（时间戳等），保留你的提问？`;
+        } else {
+          question = `把第 ${t.label} 轮中间的 ${tools} 次工具调用与结果从上下文移除，只保留提问与最终回答？`;
+        }
 
         if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
           const yes = window.confirm(question + '\n\n（只改变模型后续看到的内容；原始日志仍完整保留，可回看）');
@@ -1068,6 +1209,7 @@ window.__ModuleLoader__.load({
           userSeq: typeof t.userSeq === 'number' ? t.userSeq : undefined,
           startSeq: t.startSeq,
           endSeq: t.endSeq,
+          ...(includeDurable ? { includeDurable: true } : {}),
         };
         const line = '/trim_context ' + JSON.stringify(payload);
         setFeedback(null);
@@ -1081,9 +1223,9 @@ window.__ModuleLoader__.load({
           userSeq: typeof t.userSeq === 'number' ? t.userSeq : null,
           action,
           beforeTrimmed: Boolean(t.trimmed),
-          beforeStripped: Boolean(t.injectedStripped),
           beforeInjected: t.injectedCount || 0,
           beforeTools: tools,
+          includeDurable,
         };
         // Only a command failure logged AFTER this click may be shown as the
         // cause; the log also holds older rejections.
@@ -1158,9 +1300,12 @@ window.__ModuleLoader__.load({
           }
 
           const done = Boolean(t.trimmed);
-          const shown = Math.max(t.logToolCalls || 0, t.toolCalls || 0);
-          const hasTools = shown > 0;
-          const toolLabel = hasTools ? `${shown} 次工具调用` : '无工具调用';
+          const actions = rowActions(t);
+          const { tools, ephemeral, durable, canTrim, canStrip } = actions;
+          const shown = t.trimmed ? (t.logToolCalls || tools) : tools;
+          const toolLabel = t.trimmed
+            ? `原 ${shown} 次工具调用 · 现 0 次`
+            : (shown > 0 ? `${shown} 次工具调用` : '无工具调用');
           const saved = t.removedChars > 0 ? ` · 已移除 ~${fmtChars(t.removedChars)}` : '';
           const hasInjected = (t.injectedCount || 0) > 0;
           const blocked = busy || Boolean(t.running);
@@ -1173,7 +1318,7 @@ window.__ModuleLoader__.load({
               h('span', { style: done ? { ...S.badgeWarn, ...S.strike } : S.badgeWarn }, toolLabel),
               hasInjected
                 ? h('span', { style: S.badgeInj },
-                    `系统注入 ${t.injectedCount} 条 · ~${fmtChars(t.injectedChars)}`)
+                    `系统注入 ${t.injectedCount} 条${durable > 0 ? `（持久 ${durable}）` : ''} · ~${fmtChars(t.injectedChars)}`)
                 : null,
               t.injectedStripped ? h('span', { style: S.badgeDone }, '【注入已清】') : null,
               t.trimmed ? h('span', { style: S.badgeDone }, '【已修剪】' + saved) : null,
@@ -1183,11 +1328,13 @@ window.__ModuleLoader__.load({
             t.user ? h('div', null, h('strong', null, '提问：'), previewText(t.user, 100)) : null,
             hasInjected
               ? h('div', { style: S.note },
-                  '注入项：' + (t.injectedKinds || []).join('、') + '（非你的提问）')
+                  '注入项：' + (t.injectedKinds || []).join('、') +
+                    (durable > 0 ? '（持久项宿主只在内容变化时重发，清除后本会话将失去该说明）' : '') +
+                    '（非你的提问）')
               : null,
             t.assistant ? h('div', null, h('strong', null, '回复：'), previewText(t.assistant, 100)) : null,
             h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end', flexWrap: 'wrap' } },
-              hasTools
+              canTrim
                 ? h('button', {
                     key: 'trim',
                     type: 'button',
@@ -1199,15 +1346,17 @@ window.__ModuleLoader__.load({
                     onClick: () => act('trim_tools', t),
                   }, '✂️ 只留问答')
                 : null,
-              hasInjected
+              canStrip
                 ? h('button', {
                     key: 'strip',
                     type: 'button',
-                    style: S.btn,
+                    style: ephemeral > 0 ? S.btn : S.btnDanger,
                     disabled: blocked,
-                    title: '清除本轮的系统注入上下文（运行时快照、时间戳、技能清单等），保留你的提问',
+                    title: ephemeral > 0
+                      ? '清除本轮的一次性注入（时间戳等），保留你的提问'
+                      : '清除持久的系统注入（运行时快照、技能清单、AGENTS.md 等）。宿主只在其内容变化时重发，清除后本会话将失去这段说明',
                     onClick: () => act('strip_injected', t),
-                  }, '🧽 清注入')
+                  }, ephemeral > 0 ? '🧽 清注入' : '🧽 清持久注入')
                 : null,
               h('button', {
                 key: 'del',
@@ -1514,7 +1663,7 @@ window.__ModuleLoader__.load({
     // own surface fold and its action-settling rule against the Host's answers.
     // Never enabled by the runtime.
     if (typeof window !== 'undefined' && window.__CONTEXT_TRIMMER_TEST__ === true) {
-      plugin.__test = { buildTurns, settledFeedback };
+      plugin.__test = { buildTurns, settledFeedback, rowActions };
     }
     return plugin;
   },
