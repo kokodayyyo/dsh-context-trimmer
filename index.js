@@ -45,7 +45,7 @@ export const inject = ['commands', 'sessions'];
  * running the code I just wrote?" stops being a guess — replacing an installed
  * package needs a process restart, and an unchanged number proves it.
  */
-const HOST_BUILD = 'b15-answer-preview';
+const HOST_BUILD = 'b17-structured-identity';
 
 /** `source.kind` of the replacement node inside a compaction transaction. */
 const COMPACT_KIND = 'compact-checkpoint';
@@ -65,6 +65,9 @@ const LEGACY_INJECT_KIND = 'context-trimmer-stripped';
 
 /** Text the model reads where a trimmed turn had no answer worth keeping. */
 const TRIM_PLACEHOLDER = '（该轮的工具调用过程已由用户手动修剪，内容已从上下文中移除）';
+/** Text that replaces the tool chatter when the real final answer is kept. */
+const TRIM_NOTE = '（本轮的工具调用过程已由用户手动修剪，原始回答保留在下一则消息中）';
+/** Prefix of the identity tag carried in `compaction/summary.summary`. */
 
 /**
  * Injected `user/message` kinds this plugin may clear.
@@ -138,17 +141,26 @@ function surfaceIndex(session) {
 /**
  * Our own trimmer metadata, keyed by `compactionId`.
  *
- * `compaction/summary` carries a `trimmer` object on the transactions this
- * plugin wrote; a real compaction checkpoint has none, which is exactly how the
- * panel tells "the user trimmed this" from "the harness compacted this".
+ * ONLY the structured `summary.trimmer` field confers ownership. A checkpoint's
+ * summary text is model-generated (a later auto-compaction may re-summarize one
+ * of our summaries, and prompt injection can shape that text), so text must
+ * never decide whether a checkpoint may be folded, deleted or repaired — a
+ * spoofed tag would turn this guard into a way to delete someone else's
+ * compaction summary.
+ *
+ * If a future validator drops the extra field, the conservative outcome is that
+ * our own checkpoints read as foreign: those rows stay untrimmable instead of
+ * the guard silently relaxing.
  */
 function trimmerIndex(log) {
   const byId = new Map();
   for (const ev of log) {
     if (ev.type !== 'compaction/summary') continue;
     const data = ev.data || {};
-    if (data.trimmer === undefined || typeof data.compactionId !== 'string') continue;
-    byId.set(data.compactionId, data.trimmer);
+    if (typeof data.compactionId !== 'string') continue;
+    if (data.trimmer !== undefined && typeof data.trimmer === 'object') {
+      byId.set(data.compactionId, data.trimmer);
+    }
   }
   return byId;
 }
@@ -180,6 +192,19 @@ function isRemovedMarker(ev, trims) {
   if (src && src.kind === LEGACY_DELETE_KIND) return true;
   const meta = checkpointMeta(ev, trims);
   return Boolean(meta) && meta.mode === REMOVE_MODE;
+}
+
+/**
+ * A compaction checkpoint this plugin did not write.
+ *
+ * It ends whatever turn preceded it and is never part of the next one: it stands
+ * for a compacted region, not for a question.
+ */
+function isForeignCheckpoint(ev, trims) {
+  if (!ev || ev.type !== 'user/message') return false;
+  const src = (ev.data || {}).source;
+  if (!src || src.kind !== COMPACT_KIND) return false;
+  return checkpointMeta(ev, trims) === undefined;
 }
 
 /** A message the human actually typed. */
@@ -277,7 +302,13 @@ function openCompaction(log) {
   let open = null;
   for (const ev of log) {
     if (ev.type === 'compaction/start') {
-      open = typeof (ev.data || {}).compactionId === 'string' ? ev.data.compactionId : 'unknown';
+      const data = ev.data || {};
+      open = {
+        compactionId: typeof data.compactionId === 'string' ? data.compactionId : 'unknown',
+        sourceCommandId: data.sourceCommandId,
+        turn: data.turn === undefined ? null : data.turn,
+        startSeq: ev.seq,
+      };
     } else if (ev.type === 'compaction/end' || ev.type === 'session/end-seed') {
       open = null;
     }
@@ -316,7 +347,7 @@ function groupTurns(session, nodes, log, trims) {
   let current = null;
   let pending = [];
 
-  /** Start a row and adopt any context that preceded its boundary. */
+  /** Start a row and adopt any injected context that preceded its boundary. */
   function open(userSeq, removed) {
     const group = {
       assistantTurn: null,
@@ -361,8 +392,23 @@ function groupTurns(session, nodes, log, trims) {
       continue;
     }
 
+    // A checkpoint this plugin did not write belongs to the compaction region it
+    // replaced, never to the next question. It also ends the current turn: the
+    // retained tail after it is history the harness chose to keep, not part of
+    // the previous question. Letting either one be adopted would put the next
+    // row's start on a node the turn does not own, which makes delete refuse
+    // (foreign checkpoint) or trim misdiagnose.
+    if (isForeignCheckpoint(ev, trims)) {
+      current = null;
+      pending = [];
+      continue;
+    }
+
+    // Before the first question, only harness-injected context belongs to the
+    // upcoming turn. Assistant/tool nodes there are a compacted region's
+    // retained tail, not this turn's work.
     if (current === null) {
-      pending.push(ev);
+      if (isInjected(ev)) pending.push(ev);
       continue;
     }
 
@@ -400,31 +446,31 @@ function groupTurns(session, nodes, log, trims) {
 }
 
 /**
- * The log range one question owns: `[this user message, the next one)`.
+ * The log range every question owns: `[this user message, the next one)`.
  *
- * The log is seq-ordered, so numeric bounds are correct HERE and only here.
- * The `turn` number cannot identify a question: it is the agent-loop turn, and a
+ * The log is seq-ordered, so numeric bounds are correct HERE and only here. The
+ * `turn` number cannot identify a question: it is the agent-loop turn, and a
  * message typed while a turn is still running joins THAT turn, so several
- * questions can share `turn: 1`.
+ * questions can share `turn: 1`. Built once per answer so a row costs O(1) here
+ * instead of a full log scan.
  */
-function logRangeForUser(log, userSeq) {
-  if (typeof userSeq !== 'number') return null;
-  let next = null;
-  let seen = false;
+function buildUserRanges(log) {
+  const users = [];
   for (const ev of log) {
     if (ev.type !== 'user/message' || typeof ev.seq !== 'number') continue;
-    if (!isRealUser(ev)) continue;
-    if (ev.seq === userSeq) {
-      seen = true;
-      continue;
-    }
-    if (seen && ev.seq > userSeq && (next === null || ev.seq < next)) next = ev.seq;
+    if (isRealUser(ev)) users.push(ev.seq);
   }
-  if (!seen) return null;
-  return { from: userSeq, to: next === null ? Number.POSITIVE_INFINITY : next };
+  const ranges = new Map();
+  for (let i = 0; i < users.length; i += 1) {
+    ranges.set(users[i], {
+      from: users[i],
+      to: i + 1 < users.length ? users[i + 1] : Number.POSITIVE_INFINITY,
+    });
+  }
+  return ranges;
 }
 
-function describeTurn(group, session, log, trims) {
+function describeTurn(group, session, log, trims, plan, blocked, ranges) {
   if (group.removed) {
     return {
       turn: group.label,
@@ -445,6 +491,11 @@ function describeTurn(group, session, log, trims) {
       injectedEphemeral: 0,
       injectedDurable: 0,
       injectedStripped: false,
+      canTrim: false,
+      canDelete: false,
+      canStrip: false,
+      canStripDurable: false,
+      blockedReason: '',
       user: '',
       assistant: '',
     };
@@ -511,7 +562,7 @@ function describeTurn(group, session, log, trims) {
   // gap against the surface is exactly what a previous trim removed.
   let logToolCalls = 0;
   let logChars = 0;
-  const range = logRangeForUser(log, group.userSeq);
+  const range = ranges && ranges.get(group.userSeq);
   if (range) {
     for (const ev of log) {
       if (typeof ev.seq !== 'number' || ev.seq < range.from || ev.seq >= range.to) continue;
@@ -555,8 +606,39 @@ function describeTurn(group, session, log, trims) {
     injectedEphemeral,
     injectedDurable,
     injectedStripped,
+    // Actionability comes from the SAME planners the command handler runs, so a
+    // rendered button is never a promise the Host cannot keep.
+    ...rowActionsOf(session, plan, group, trims, blocked),
     user: userText,
     assistant: assistantText,
+  };
+}
+
+/** The action flags one row advertises, derived from the shared planners. */
+function rowActionsOf(session, plan, group, trims, blocked) {
+  if (blocked) {
+    return {
+      canTrim: false,
+      canDelete: false,
+      canStrip: false,
+      canStripDurable: false,
+      trimReason: blocked,
+      deleteReason: blocked,
+      stripReason: blocked,
+    };
+  }
+  const trimPlan = planTrim(session, plan, group, trims);
+  const deletePlan = planDelete(session, plan, group, trims);
+  const stripPlan = planStrip(session, plan, group, trims, false);
+  const stripDurablePlan = planStrip(session, plan, group, trims, true);
+  return {
+    canTrim: !trimPlan.error,
+    canDelete: !deletePlan.error,
+    canStrip: !stripPlan.error,
+    canStripDurable: !stripDurablePlan.error,
+    trimReason: trimPlan.error || '',
+    deleteReason: deletePlan.error || '',
+    stripReason: stripPlan.error || '',
   };
 }
 
@@ -575,38 +657,12 @@ function answeredCallId(ev) {
 }
 
 /**
- * Grow a surface span until it never splits a tool call from its result.
- *
- * The expansion is bidirectional and re-checked until stable. Everything here is
- * a POSITION in `index.nodes`: a replacement event's seq says nothing about
- * where it sits.
- *
- * @param floorSeq - first node this span may occupy (the turn's own first node).
- * @returns the closed span as `{ start, end }` indices, or null when closing it
- *          would swallow a neighbouring question.
+ * Precomputed per-surface data so every row's plan is O(its own span), not
+ * O(whole log). Built once per command / one `list_json` answer.
  */
-function closeOverToolPairs(session, index, startSeq, endSeq, userSeq, floorSeq) {
-  const { nodes, pos } = index;
-  let start = pos.get(startSeq);
-  let end = pos.get(endSeq);
-  if (start === undefined || end === undefined || start > end) return null;
-
-  const floor = pos.get(floorSeq);
-  if (floor === undefined) return null;
-
-  // The next real question bounds the span: crossing it would fold two
-  // questions into one replacement and erase a message the user typed.
-  const userIdx = typeof userSeq === 'number' ? pos.get(userSeq) : undefined;
-  let limit = nodes.length;
-  if (userIdx !== undefined) {
-    for (let i = userIdx + 1; i < nodes.length; i += 1) {
-      if (isRealUser(session.eventAt(nodes[i]))) {
-        limit = i;
-        break;
-      }
-    }
-  }
-
+function surfacePlan(session) {
+  const index = surfaceIndex(session);
+  const { nodes } = index;
   const callAt = new Map(); // callId -> position of the declaring assistant/message
   const resultAt = new Map(); // callId -> position of the answering tool/result
   for (let i = 0; i < nodes.length; i += 1) {
@@ -619,27 +675,63 @@ function closeOverToolPairs(session, index, startSeq, endSeq, userSeq, floorSeq)
       if (id !== null) resultAt.set(id, i);
     }
   }
+  // nextQuestion[i] = position of the first real user message at or after i.
+  const nextQuestion = new Array(nodes.length + 1).fill(nodes.length);
+  for (let i = nodes.length - 1; i >= 0; i -= 1) {
+    nextQuestion[i] = isRealUser(session.eventAt(nodes[i])) ? i : nextQuestion[i + 1];
+  }
+  return { index, callAt, resultAt, nextQuestion };
+}
+
+/**
+ * Grow a surface span until it never splits a tool call from its result.
+ *
+ * The expansion is bidirectional and re-checked until stable, scanning only the
+ * span (the shared maps make each pass O(span)). Everything here is a POSITION in
+ * `plan.index.nodes`: a replacement event's seq says nothing about where it sits.
+ *
+ * @param floorSeq - first node this span may occupy (the turn's own first node).
+ * @returns the closed span as `{ start, end }` indices, or null when closing it
+ *          would swallow a neighbouring question.
+ */
+function closeOverToolPairs(session, plan, startSeq, endSeq, userSeq, floorSeq) {
+  const { index, callAt, resultAt, nextQuestion } = plan;
+  const { nodes, pos } = index;
+  let start = pos.get(startSeq);
+  let end = pos.get(endSeq);
+  if (start === undefined || end === undefined || start > end) return null;
+
+  const floor = pos.get(floorSeq);
+  if (floor === undefined) return null;
+
+  // The next real question bounds the span: crossing it would fold two
+  // questions into one replacement and erase a message the user typed.
+  const userIdx = typeof userSeq === 'number' ? pos.get(userSeq) : undefined;
+  const limit = userIdx === undefined ? nodes.length : nextQuestion[userIdx + 1];
 
   for (let guard = 0; guard <= nodes.length; guard += 1) {
     let changed = false;
-    for (const [id, callIdx] of callAt) {
-      const resultIdx = resultAt.get(id);
-      if (resultIdx === undefined) continue;
-      if (callIdx >= start && callIdx <= end) {
-        if (resultIdx > end) {
-          end = resultIdx;
-          changed = true;
+    for (let i = start; i <= end; i += 1) {
+      const ev = session.eventAt(nodes[i]);
+      if (!ev) continue;
+      if (ev.type === 'assistant/message') {
+        for (const id of declaredCallIds(ev)) {
+          const resultIdx = resultAt.get(id);
+          if (resultIdx === undefined) continue;
+          if (resultIdx > end) {
+            end = resultIdx;
+            changed = true;
+          }
+          if (resultIdx < start) {
+            start = resultIdx;
+            changed = true;
+          }
         }
-        if (resultIdx < start) {
-          start = resultIdx;
-          changed = true;
-        }
-      }
-    }
-    for (const [id, resultIdx] of resultAt) {
-      const callIdx = callAt.get(id);
-      if (callIdx === undefined) continue;
-      if (resultIdx >= start && resultIdx <= end) {
+      } else if (ev.type === 'tool/result') {
+        const id = answeredCallId(ev);
+        if (id === null) continue;
+        const callIdx = callAt.get(id);
+        if (callIdx === undefined) continue;
         if (callIdx < start) {
           start = callIdx;
           changed = true;
@@ -686,6 +778,8 @@ function findTurn(session, nodes, payload, log, trims) {
   const groups = groupTurns(session, nodes, log, trims).filter((g) => !g.removed);
   if (groups.length === 0) return null;
 
+  // The caller's identifier must match exactly. Falling through to a weaker one
+  // would silently address a different turn after a compaction moved labels.
   const raw = payload && payload.label !== undefined ? payload.label : payload && payload.turn;
   const wanted = Number(raw);
   if (Number.isFinite(wanted)) {
@@ -694,13 +788,11 @@ function findTurn(session, nodes, payload, log, trims) {
   }
   const userSeq = Number(payload && payload.userSeq);
   if (Number.isFinite(userSeq)) {
-    const byUser = groups.find((g) => g.userSeq === userSeq);
-    if (byUser) return byUser;
+    return groups.find((g) => g.userSeq === userSeq) ?? null;
   }
   const startSeq = Number(payload && payload.startSeq);
   if (Number.isFinite(startSeq)) {
-    const bySeq = groups.find((g) => g.startSeq === startSeq || g.seqs.indexOf(startSeq) !== -1);
-    if (bySeq) return bySeq;
+    return groups.find((g) => g.startSeq === startSeq || g.seqs.indexOf(startSeq) !== -1) ?? null;
   }
   return null;
 }
@@ -736,8 +828,8 @@ function hasUnsettledToolCall(group) {
 }
 
 /** Rough token count for a shadowed span, preferring the harness meter. */
-function shadowedTokens(ctx, session, seqs) {
-  const log = logEvents(session);
+function shadowedTokens(ctx, session, seqs, suppliedLog) {
+  const log = Array.isArray(suppliedLog) ? suppliedLog : logEvents(session);
   const meter = ctx && typeof ctx.get === 'function' ? ctx.get('tokenMeter') : undefined;
   if (meter && typeof meter.measure === 'function') {
     try {
@@ -770,17 +862,32 @@ function shadowedTokens(ctx, session, seqs) {
 }
 
 /** Provider/model of the session's current request header, when known. */
-function headerRoute(session) {
+function headerRoute(session, log) {
   try {
-    if (typeof session.requestHeader !== 'function') return {};
-    const header = session.requestHeader();
-    const config = header && header.config;
-    if (!config) return {};
-    if (typeof config.provider !== 'string' || typeof config.model !== 'string') return {};
-    return { provider: config.provider, model: config.model };
+    if (typeof session.requestHeader === 'function') {
+      const header = session.requestHeader();
+      const config = header && header.config;
+      if (config && typeof config.provider === 'string' && typeof config.model === 'string') {
+        return { provider: config.provider, model: config.model };
+      }
+    }
   } catch {
-    return {};
+    /* fall through to the logged header */
   }
+  // Older/synthetic sessions may not expose the accessor; the last logged
+  // request header still names the route.
+  if (Array.isArray(log)) {
+    for (let i = log.length - 1; i >= 0; i -= 1) {
+      if (log[i].type !== 'request/header') continue;
+      const header = (log[i].data || {}).header || {};
+      const config = header.config || header;
+      if (typeof config.provider === 'string' && typeof config.model === 'string') {
+        return { provider: config.provider, model: config.model };
+      }
+      break;
+    }
+  }
+  return {};
 }
 
 /**
@@ -818,7 +925,7 @@ function writeCheckpoint(ctx, session, opts) {
     compactionId,
     ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
   };
-  const route = headerRoute(session);
+  const route = headerRoute(session, opts.log);
   const startEvent = session.append('compaction/start', { ...common, turn: opts.turn });
   try {
     const summaryEvent = session.append('compaction/summary', {
@@ -826,7 +933,7 @@ function writeCheckpoint(ctx, session, opts) {
       summary: [{ type: 'text', text: opts.summary }],
       shadowedRange: { start: opts.startSeq, end: opts.endSeq },
       shadowedSeqs: opts.shadowed,
-      shadowedTokenCount: shadowedTokens(ctx, session, opts.shadowed),
+      shadowedTokenCount: shadowedTokens(ctx, session, opts.shadowed, opts.log),
       ...route,
       trimmer: {
         mode: opts.mode,
@@ -849,6 +956,9 @@ function writeCheckpoint(ctx, session, opts) {
         sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...opts.shadowed],
       },
     );
+    // The success end lives INSIDE the try: a failing end would otherwise leave
+    // the bracket open forever, blocking every later action.
+    session.append('compaction/end', { ...common, turn: opts.turn });
   } catch (error) {
     try {
       session.append('compaction/end', {
@@ -861,7 +971,6 @@ function writeCheckpoint(ctx, session, opts) {
     }
     throw error;
   }
-  session.append('compaction/end', { ...common, turn: opts.turn });
 }
 
 /** Shared preconditions for every transaction. */
@@ -874,11 +983,9 @@ function transactionBlocker(log) {
 }
 
 /** Shared refusal for a turn the agent is still writing into. */
-function refuseRunning(group, verb) {
-  return fail(
-    `第 ${group.label} 轮还在进行中（模型仍在生成），现在${verb}会让这一轮后续的内容` +
-      '落在标记之后，等于没有修剪。请等该轮结束后再操作。',
-  );
+function refuseRunningText(group, verb) {
+  return `第 ${group.label} 轮还在进行中（模型仍在生成），现在${verb}会让这一轮后续的内容` +
+    '落在标记之后，等于没有修剪。请等该轮结束后再操作。';
 }
 
 /** Reject a span that would shadow a checkpoint this plugin did not write. */
@@ -894,147 +1001,240 @@ function foreignCheckpointInside(session, index, span, trims) {
   return false;
 }
 
+/* --------------------------------------------------------------- row plans */
+// The panel and the command handler both ask the SAME functions whether an
+// action is possible. That is what keeps a rendered button from being a promise
+// the Host cannot keep.
+
+/** Plan `trim_tools` for one row: the closed span and the checkpoint content. */
+function planTrim(session, plan, group, trims) {
+  if (group.running) return { error: refuseRunningText(group, '修剪') };
+
+  const raw = toolSpanOf(group);
+  if (!raw) return { error: `第 ${group.label} 轮没有可修剪的工具调用。` };
+
+  const unsettled = hasUnsettledToolCall(group);
+  if (unsettled) {
+    return {
+      error:
+        `第 ${group.label} 轮还有工具调用未返回结果（${unsettled.name}），` +
+        '现在修剪会让消息失去配对而无法发送。请等该轮结束（工具返回）后再修剪。',
+    };
+  }
+
+  const span = closeOverToolPairs(
+    session, plan, raw.startSeq, raw.endSeq, group.userSeq, group.startSeq,
+  );
+  if (!span) {
+    return {
+      error:
+        `第 ${group.label} 轮的工具调用跨越到相邻提问之外，单独修剪会让消息失去配对。` +
+        '请改用「删除本轮」，或等该轮结束再修剪。',
+    };
+  }
+
+  const userIdx = plan.index.pos.get(group.userSeq);
+  if (userIdx !== undefined && span.start <= userIdx) {
+    return {
+      error:
+        `第 ${group.label} 轮里有工具结果属于更早的提问（提问发出时上一轮还在运行），` +
+        '折叠它会把上一轮的调用声明一起卷进来。请等该轮结束后重试。',
+    };
+  }
+
+  if (foreignCheckpointInside(session, plan.index, span, trims)) {
+    return {
+      error: `第 ${group.label} 轮的范围内包含一条外部压缩检查点，修剪它会让整段摘要消失。已拒绝。`,
+    };
+  }
+
+  // Prefer keeping the real final answer as an assistant node: the checkpoint
+  // then carries a note instead of re-labelling the model's own answer as user
+  // input. Only a trailing, tool-call-free assistant qualifies.
+  let end = span.end;
+  let content = null;
+  const last = session.eventAt(plan.index.nodes[end]);
+  const lastContent = last && last.type === 'assistant/message' && last.data && last.data.message
+    ? last.data.message.content
+    : null;
+  if (
+    end > span.start
+    && Array.isArray(lastContent)
+    && !hasToolCallBlocks(lastContent)
+    && answerBlocks(lastContent).length > 0
+  ) {
+    end -= 1;
+    content = [{ type: 'text', text: TRIM_NOTE }];
+  }
+
+  const shadowed = plan.index.nodes.slice(span.start, end + 1);
+  if (shadowed.length === 0) {
+    return { error: '要修剪的范围已不在当前表面上，请点「刷新」后重试。' };
+  }
+
+  if (content === null) {
+    // The answer cannot be kept: carry its text into the checkpoint.
+    let sourceMessage = null;
+    for (let i = span.start; i <= end; i += 1) {
+      const ev = session.eventAt(plan.index.nodes[i]);
+      if (!ev || ev.type !== 'assistant/message') continue;
+      const message = ev.data && ev.data.message;
+      if (message) sourceMessage = message;
+    }
+    if (!sourceMessage) return { error: '没有找到该轮最终的助手消息，无法安全替换。' };
+    const kept = answerBlocks(sourceMessage.content);
+    content = kept.length > 0 ? kept : [{ type: 'text', text: TRIM_PLACEHOLDER }];
+  }
+
+  return { span: { start: span.start, end }, shadowed, content };
+}
+
+/** Plan `delete_turn` for one row. */
+function planDelete(session, plan, group, trims) {
+  if (group.running) return { error: refuseRunningText(group, '删除') };
+
+  const unsettled = hasUnsettledToolCall(group);
+  if (unsettled) {
+    return {
+      error:
+        `第 ${group.label} 轮还有工具调用未返回结果（${unsettled.name}），现在删除会让` +
+        '随后返回的工具结果失去配对、无法发送。请等该轮结束后再删除。',
+    };
+  }
+
+  const span = closeOverToolPairs(
+    session, plan, group.startSeq, group.endSeq, group.userSeq, group.startSeq,
+  );
+  if (!span) {
+    return {
+      error:
+        '这一轮的工具调用与相邻轮次交错，删除会让配对断开或卷进上一个提问，已拒绝。' +
+        '请先修剪相邻轮次再试。',
+    };
+  }
+
+  if (foreignCheckpointInside(session, plan.index, span, trims)) {
+    return {
+      error: `第 ${group.label} 轮的范围内包含一条外部压缩检查点，删除它会让整段摘要消失。已拒绝。`,
+    };
+  }
+
+  const shadowed = plan.index.nodes.slice(span.start, span.end + 1);
+  if (shadowed.length === 0) {
+    return { error: '要删除的范围已不在当前表面上，请点「刷新」后重试。' };
+  }
+  return { span, shadowed };
+}
+
+/** Plan `strip_injected` for one row: one contiguous run per transaction. */
+function planStrip(session, plan, group, trims, includeDurable) {
+  if (group.running) return { error: refuseRunningText(group, '清除注入') };
+  if (group.injected.length === 0) return { error: `第 ${group.label} 轮没有系统注入上下文。` };
+
+  const selected = group.injected.filter((ev) => {
+    const kind = ((ev.data || {}).source || {}).kind;
+    return includeDurable ? DURABLE_INJECTED.has(kind) : EPHEMERAL_INJECTED.has(kind);
+  });
+  if (selected.length === 0) {
+    if (!includeDurable) {
+      const durable = group.injected.filter((ev) => DURABLE_INJECTED.has(((ev.data || {}).source || {}).kind));
+      return {
+        error:
+          `第 ${group.label} 轮没有可安全清除的瞬时注入（time-context）。` +
+          (durable.length > 0
+            ? `本轮还有 ${durable.length} 条持久注入（${kindsOf(durable).join(' / ')}）：` +
+              '宿主只在其内容变化时重发，清除后本轮之后的会话会失去这段说明。确认后请用 includeDurable 再执行一次。'
+            : ''),
+      };
+    }
+    return { error: `第 ${group.label} 轮没有持久注入上下文。` };
+  }
+
+  // Separate bursts are replaced one transaction at a time: one wide range would
+  // shadow the answers and tool results between them.
+  const runs = injectedRuns(plan.index.nodes, selected);
+  if (runs.length === 0) return { error: '注入节点已不在当前表面上，请刷新后重试。' };
+
+  const planned = [];
+  for (const run of runs) {
+    const first = run[0];
+    const last = run[run.length - 1];
+    const start = plan.index.pos.get(first.seq);
+    const end = plan.index.pos.get(last.seq);
+    if (start === undefined || end === undefined || start > end) {
+      return { error: '注入范围已不在当前表面上，请刷新后重试。' };
+    }
+    planned.push({
+      first,
+      last,
+      shadowed: plan.index.nodes.slice(start, end + 1),
+      count: run.length,
+    });
+  }
+  return { runs: planned, selected: selected.length, includeDurable };
+}
+
 function trimTools(session, payload, env) {
   const log = logEvents(session);
   const trims = trimmerIndex(log);
-  const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload, log, trims);
+  const plan = surfacePlan(session);
+  const group = findTurn(session, plan.index.nodes, payload, log, trims);
   if (!group) return fail('没有找到要修剪的轮次（请点「刷新」后重试）。');
-  if (group.running) return refuseRunning(group, '修剪');
 
   const blocked = transactionBlocker(log);
   if (blocked) return fail(blocked);
 
-  const raw = toolSpanOf(group);
-  if (!raw) return fail(`第 ${group.label} 轮没有可修剪的工具调用。`);
-
-  const unsettled = hasUnsettledToolCall(group);
-  if (unsettled) {
-    return fail(
-      `第 ${group.label} 轮还有工具调用未返回结果（${unsettled.name}），` +
-        '现在修剪会让消息失去配对而无法发送。请等该轮结束（工具返回）后再修剪。',
-    );
-  }
-
-  const span = closeOverToolPairs(
-    session, index, raw.startSeq, raw.endSeq, group.userSeq, group.startSeq,
-  );
-  if (!span) {
-    return fail(
-      `第 ${group.label} 轮的工具调用跨越到相邻提问之外，单独修剪会让消息失去配对。` +
-        '请改用「删除本轮」，或等该轮结束再修剪。',
-    );
-  }
-
-  const userIdx = index.pos.get(group.userSeq);
-  if (userIdx !== undefined && span.start <= userIdx) {
-    return fail(
-      `第 ${group.label} 轮里有工具结果属于更早的提问（提问发出时上一轮还在运行），` +
-        '折叠它会把上一轮的调用声明一起卷进来。请等该轮结束后重试。',
-    );
-  }
-
-  if (foreignCheckpointInside(session, index, span, trims)) {
-    return fail(
-      `第 ${group.label} 轮的范围内包含一条系统压缩检查点，修剪它会让整段摘要消失。已拒绝。`,
-    );
-  }
-
-  const shadowed = index.nodes.slice(span.start, span.end + 1);
-  if (shadowed.length === 0) {
-    return fail('要修剪的范围已不在当前表面上，请点「刷新」后重试。');
-  }
-
-  // The answer that survives is the LAST assistant message inside the closed
-  // span, by position.
-  let sourceMessage = null;
-  for (let i = span.start; i <= span.end; i += 1) {
-    const ev = session.eventAt(index.nodes[i]);
-    if (!ev || ev.type !== 'assistant/message') continue;
-    const message = ev.data && ev.data.message;
-    if (message) sourceMessage = message;
-  }
-  if (!sourceMessage) return fail('没有找到该轮最终的助手消息，无法安全替换。');
-
-  const kept = answerBlocks(sourceMessage.content);
-  const content = kept.length > 0 ? kept : [{ type: 'text', text: TRIM_PLACEHOLDER }];
+  const planned = planTrim(session, plan, group, trims);
+  if (planned.error) return fail(planned.error);
 
   writeCheckpoint(env.ctx, session, {
+    log,
     sourceCommandId: env.commandId,
     turn: env.turn,
-    startSeq: index.nodes[span.start],
-    endSeq: index.nodes[span.end],
-    shadowed,
-    content,
-    summary: `用户手动修剪第 ${group.label} 轮的工具调用（保留最终回答，折叠 ${shadowed.length} 个表面节点）`,
+    startSeq: plan.index.nodes[planned.span.start],
+    endSeq: plan.index.nodes[planned.span.end],
+    shadowed: planned.shadowed,
+    content: planned.content,
+    summary: `用户手动修剪第 ${group.label} 轮的工具调用（折叠 ${planned.shadowed.length} 个表面节点）`,
     mode: TRIM_MODE,
     label: group.label,
     userSeq: group.userSeq,
   });
 
   return ok(
-    `已修剪第 ${group.label} 轮的工具调用（${shadowed.length} 个表面节点折叠为问答）。`,
+    `已修剪第 ${group.label} 轮的工具调用（${planned.shadowed.length} 个表面节点折叠）。`,
   );
 }
 
 function deleteTurn(session, payload, env) {
   const log = logEvents(session);
   const trims = trimmerIndex(log);
-  const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload, log, trims);
+  const plan = surfacePlan(session);
+  const group = findTurn(session, plan.index.nodes, payload, log, trims);
   if (!group) return fail('没有找到要删除的轮次（请点「刷新」后重试）。');
-  if (group.running) return refuseRunning(group, '删除');
 
   const blocked = transactionBlocker(log);
   if (blocked) return fail(blocked);
 
-  // A removal has to keep every tool call with its results too. The guard below
-  // runs before `closeOverToolPairs` so a half-open turn reports the real reason
-  // instead of "crosses the boundary".
-  const unsettled = hasUnsettledToolCall(group);
-  if (unsettled) {
-    return fail(
-      `第 ${group.label} 轮还有工具调用未返回结果（${unsettled.name}），现在删除会让` +
-        '随后返回的工具结果失去配对、无法发送。请等该轮结束后再删除。',
-    );
-  }
-
-  const span = closeOverToolPairs(
-    session, index, group.startSeq, group.endSeq, group.userSeq, group.startSeq,
-  );
-  if (!span) {
-    return fail(
-      '这一轮的工具调用与相邻轮次交错，删除会让配对断开或卷进上一个提问，已拒绝。' +
-        '请先修剪相邻轮次再试。',
-    );
-  }
-
-  if (foreignCheckpointInside(session, index, span, trims)) {
-    return fail(
-      `第 ${group.label} 轮的范围内包含一条系统压缩检查点，删除它会让整段摘要消失。已拒绝。`,
-    );
-  }
-
-  const shadowed = index.nodes.slice(span.start, span.end + 1);
-  if (shadowed.length === 0) {
-    return fail('要删除的范围已不在当前表面上，请点「刷新」后重试。');
-  }
+  const planned = planDelete(session, plan, group, trims);
+  if (planned.error) return fail(planned.error);
 
   writeCheckpoint(env.ctx, session, {
+    log,
     sourceCommandId: env.commandId,
     turn: env.turn,
-    startSeq: index.nodes[span.start],
-    endSeq: index.nodes[span.end],
-    shadowed,
+    startSeq: plan.index.nodes[planned.span.start],
+    endSeq: plan.index.nodes[planned.span.end],
+    shadowed: planned.shadowed,
     content: [{ type: 'text', text: `（原第 ${group.label} 轮问答已由用户手动移除，内容已从上下文中移除）` }],
-    summary: `用户手动移除第 ${group.label} 轮问答（折叠 ${shadowed.length} 个表面节点）`,
+    summary: `用户手动移除第 ${group.label} 轮问答（折叠 ${planned.shadowed.length} 个表面节点）`,
     mode: REMOVE_MODE,
     label: group.label,
     userSeq: group.userSeq,
   });
 
   return ok(
-    `已从上下文表面移除第 ${group.label} 轮问答（${shadowed.length} 个表面节点）。`,
+    `已从上下文表面移除第 ${group.label} 轮问答（${planned.shadowed.length} 个表面节点）。`,
   );
 }
 
@@ -1070,10 +1270,9 @@ function kindsOf(events) {
 function stripInjected(session, payload, env) {
   const log = logEvents(session);
   const trims = trimmerIndex(log);
-  const index = surfaceIndex(session);
-  const group = findTurn(session, index.nodes, payload, log, trims);
+  const plan = surfacePlan(session);
+  const group = findTurn(session, plan.index.nodes, payload, log, trims);
   if (!group) return fail('没有找到该轮次（请点「刷新」后重试）。');
-  if (group.injected.length === 0) return fail(`第 ${group.label} 轮没有系统注入上下文。`);
 
   const blocked = transactionBlocker(log);
   if (blocked) return fail(blocked);
@@ -1082,57 +1281,29 @@ function stripInjected(session, payload, env) {
   // clearing one can remove that guidance for the rest of the session. Only do
   // it when the caller explicitly asks.
   const includeDurable = payload && payload.includeDurable === true;
-  const selected = group.injected.filter((ev) => {
-    const kind = ((ev.data || {}).source || {}).kind;
-    return includeDurable ? DURABLE_INJECTED.has(kind) : EPHEMERAL_INJECTED.has(kind);
-  });
-  if (selected.length === 0) {
-    if (!includeDurable) {
-      const durable = group.injected.filter((ev) => DURABLE_INJECTED.has(((ev.data || {}).source || {}).kind));
-      return fail(
-        `第 ${group.label} 轮没有可安全清除的瞬时注入（time-context）。` +
-          (durable.length > 0
-            ? `本轮还有 ${durable.length} 条持久注入（${kindsOf(durable).join(' / ')}）：` +
-              '宿主只在其内容变化时重发，清除后本轮之后的会话会失去这段说明。确认后请用 includeDurable 再执行一次。'
-            : ''),
-      );
-    }
-    return fail(`第 ${group.label} 轮没有持久注入上下文。`);
-  }
-
-  // Separate bursts are replaced one transaction at a time: one wide range would
-  // shadow the answers and tool results between them.
-  const runs = injectedRuns(index.nodes, selected);
-  if (runs.length === 0) return fail('注入节点已不在当前表面上，请刷新后重试。');
+  const planned = planStrip(session, plan, group, trims, includeDurable);
+  if (planned.error) return fail(planned.error);
 
   let cleared = 0;
   let shadowedTotal = 0;
 
-  for (const run of runs) {
-    const first = run[0];
-    const last = run[run.length - 1];
-    const start = index.pos.get(first.seq);
-    const end = index.pos.get(last.seq);
-    if (start === undefined || end === undefined || start > end) {
-      return fail('注入范围已不在当前表面上，请刷新后重试。');
-    }
-    const shadowed = index.nodes.slice(start, end + 1);
-
+  for (const run of planned.runs) {
     writeCheckpoint(env.ctx, session, {
+      log,
       sourceCommandId: env.commandId,
       turn: env.turn,
-      startSeq: index.nodes[start],
-      endSeq: index.nodes[end],
-      shadowed,
+      startSeq: run.first.seq,
+      endSeq: run.last.seq,
+      shadowed: run.shadowed,
       content: [{ type: 'text', text: '（已清除的系统注入上下文）' }],
-      summary: `用户手动清除第 ${group.label} 轮的系统注入上下文（${run.length} 条）`,
+      summary: `用户手动清除第 ${group.label} 轮的系统注入上下文（${run.count} 条）`,
       mode: STRIP_MODE,
       label: group.label,
       userSeq: group.userSeq,
     });
 
-    cleared += run.length;
-    shadowedTotal += shadowed.length;
+    cleared += run.count;
+    shadowedTotal += run.shadowed.length;
   }
 
   const scope = includeDurable ? '持久' : '瞬时';
@@ -1186,6 +1357,7 @@ function rowLines(rows, nodes) {
   lines.push('  删除整轮：/trim_context {"action":"delete_turn","turn":<轮次>}');
   lines.push('  清瞬时注入：/trim_context {"action":"strip_injected","turn":<轮次>}');
   lines.push('  清持久注入：/trim_context {"action":"strip_injected","turn":<轮次>,"includeDurable":true}');
+  lines.push('  修复事务：  /trim_context {"action":"repair"}');
   return lines.join('\n');
 }
 
@@ -1193,7 +1365,11 @@ function listTurns(session) {
   const nodes = surfaceNodes(session);
   const log = logEvents(session);
   const trims = trimmerIndex(log);
-  const rows = groupTurns(session, nodes, log, trims).map((g) => describeTurn(g, session, log, trims));
+  const plan = surfacePlan(session);
+  const blocked = transactionBlocker(log);
+  const ranges = buildUserRanges(log);
+  const rows = groupTurns(session, nodes, log, trims)
+    .map((g) => describeTurn(g, session, log, trims, plan, blocked, ranges));
   if (rows.length === 0) return ok('当前会话还没有真实提问。');
   return ok(rowLines(rows, nodes));
 }
@@ -1202,8 +1378,43 @@ function listTurnsJson(session) {
   const nodes = surfaceNodes(session);
   const log = logEvents(session);
   const trims = trimmerIndex(log);
-  const rows = groupTurns(session, nodes, log, trims).map((g) => describeTurn(g, session, log, trims));
-  return ok(JSON.stringify({ build: HOST_BUILD, turns: rows }));
+  const plan = surfacePlan(session);
+  const blocked = transactionBlocker(log);
+  const ranges = buildUserRanges(log);
+  const rows = groupTurns(session, nodes, log, trims)
+    .map((g) => describeTurn(g, session, log, trims, plan, blocked, ranges));
+  return ok(JSON.stringify({ build: HOST_BUILD, turns: rows, blocked }));
+}
+
+/**
+ * Close an open bracket this plugin demonstrably owns.
+ *
+ * Ownership is proven ONLY by the structured `summary.trimmer` field this plugin
+ * writes into `compaction/summary`; a summary's text is model-generated and must
+ * never authorize closing someone else's transaction. The checkpoint is not
+ * required: a failed checkpoint is exactly one of the states this action exists
+ * to recover.
+ */
+function repairTransaction(session) {
+  const log = logEvents(session);
+  const open = openCompaction(log);
+  if (!open) return ok('没有需要修复的压缩事务。');
+
+  const trims = trimmerIndex(log);
+  if (!trims.has(open.compactionId)) {
+    return fail(
+      `未闭合的事务 ${String(open.compactionId)} 没有本插件的结构化标记（summary.trimmer），` +
+        '拒绝代为关闭。请重启会话或交给压缩插件处理。',
+    );
+  }
+
+  session.append('compaction/end', {
+    compactionId: open.compactionId,
+    ...(open.sourceCommandId === undefined ? {} : { sourceCommandId: open.sourceCommandId }),
+    turn: open.turn,
+    error: 'closed by context-trimmer repair',
+  });
+  return ok(`已闭合第 ${open.startSeq} 号开始的事务（${String(open.compactionId)}）。`);
 }
 
 export function apply(ctx) {
@@ -1243,6 +1454,7 @@ export function apply(ctx) {
         if (action === 'trim_tools') return trimTools(session, payload, env);
         if (action === 'delete_turn') return deleteTurn(session, payload, env);
         if (action === 'strip_injected') return stripInjected(session, payload, env);
+        if (action === 'repair') return repairTransaction(session);
         return fail(`未知操作：${String(action)}`);
       } catch (err) {
         const message = err && err.message ? err.message : String(err);

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-context-trimmer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Context Trimmer for DSH: View and manually trim intermediate tool calls and turns from conversation context.",
   "private": true,
   "type": "module",

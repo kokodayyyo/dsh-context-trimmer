@@ -131,14 +131,27 @@ window.__ModuleLoader__.load({
       const ephemeral = t.injectedEphemeral || 0;
       const durable = t.injectedDurable || 0;
       const live = !t.removed && !t.running;
+      // The Host's verdict wins when present: it runs the same planners the
+      // command handler runs, so a rendered control can never promise something
+      // the Host refuses. Local inference only serves the fallback window mode.
+      const hosted = typeof t.canTrim === 'boolean';
+      const canStrip = hosted ? Boolean(t.canStrip) : live && ephemeral > 0;
+      const canStripDurable = hosted
+        ? Boolean(t.canStripDurable)
+        : live && durable > 0;
       return {
         tools,
         ephemeral,
         durable,
-        canTrim: live && !t.trimmed && tools > 0,
-        canStrip: live && (ephemeral > 0 || durable > 0),
+        canTrim: hosted ? Boolean(t.canTrim) : live && !t.trimmed && tools > 0,
+        canDelete: hosted ? Boolean(t.canDelete) : live,
+        canStrip,
+        canStripDurable,
         // Durable carriers are cleared in their own, explicitly confirmed step.
-        includeDurable: ephemeral === 0 && durable > 0,
+        includeDurable: !canStrip && canStripDurable,
+        trimReason: t.trimReason || '',
+        deleteReason: t.deleteReason || '',
+        stripReason: t.stripReason || '',
       };
     }
 
@@ -335,6 +348,14 @@ window.__ModuleLoader__.load({
       return !src || src.kind === 'user';
     }
 
+    /** A compaction checkpoint this plugin did not write: a region boundary. */
+    function isForeignCheckpoint(ev, trims) {
+      if (!ev || ev.type !== 'user/message') return false;
+      const src = (ev.data || {}).source;
+      if (!src || src.kind !== COMPACT_KIND) return false;
+      return checkpointMeta(ev, trims) === undefined;
+    }
+
     /** Harness injection this panel may show (and offer to clear). */
     function isInjectedEvent(ev) {
       if (!ev || ev.type !== 'user/message') return false;
@@ -432,9 +453,20 @@ window.__ModuleLoader__.load({
           continue;
         }
 
+        // A checkpoint this plugin did not write belongs to the compaction
+        // region it replaced, never to the next question; it also ends the
+        // current turn. Adopting it would put a row's start on a node the turn
+        // does not own (Host does the same, so the two never drift).
+        if (isForeignCheckpoint(ev, trims)) {
+          current = null;
+          pending = [];
+          continue;
+        }
+
         if (type === 'user/message') {
           if (current === null) {
-            pending.push(ev);
+            // Before the first question only injected context belongs to it.
+            if (isInjectedEvent(ev)) pending.push(ev);
             continue;
           }
           current.lastSeq = ev.seq;
@@ -477,7 +509,8 @@ window.__ModuleLoader__.load({
         }
 
         if (current === null) {
-          pending.push(ev);
+          // Assistant/tool nodes before the first question are a compacted
+          // region's retained tail, not this turn's work.
           continue;
         }
         current.lastSeq = ev.seq;
@@ -810,7 +843,11 @@ window.__ModuleLoader__.load({
         if (text.charAt(0) !== '{') continue;
         try {
           const parsed = JSON.parse(text);
-          if (parsed && Array.isArray(parsed.turns)) return { dump: parsed, seq: ev.seq };
+          // The dump is the only JSON this plugin asks for; require its build
+          // string so an unrelated JSON payload can never be mistaken for it.
+          if (parsed && Array.isArray(parsed.turns) && typeof parsed.build === 'string') {
+            return { dump: parsed, seq: ev.seq };
+          }
         } catch { /* not the Host dump */ }
       }
       return null;
@@ -1163,6 +1200,26 @@ window.__ModuleLoader__.load({
         const durable = actions.durable;
         const includeDurable = isStrip && actions.includeDurable;
 
+        // The Host already said this action is not possible; surface why instead
+        // of sending a command that is bound to be refused.
+        const blockedReason = isDelete
+          ? actions.deleteReason
+          : isStrip
+            ? actions.stripReason
+            : actions.trimReason;
+        const allowed = isDelete
+          ? actions.canDelete
+          : isStrip
+            ? (actions.canStrip || actions.canStripDurable)
+            : actions.canTrim;
+        if (!allowed) {
+          setFeedback({
+            kind: 'warn',
+            text: blockedReason || `第 ${t.label} 轮当前不能${isDelete ? '删除' : isStrip ? '清除注入' : '修剪'}。`,
+          });
+          return;
+        }
+
         if (t.running) {
           setFeedback({
             kind: 'warn',
@@ -1301,7 +1358,7 @@ window.__ModuleLoader__.load({
 
           const done = Boolean(t.trimmed);
           const actions = rowActions(t);
-          const { tools, ephemeral, durable, canTrim, canStrip } = actions;
+          const { tools, ephemeral, durable, canTrim, canDelete, canStrip, canStripDurable } = actions;
           const shown = t.trimmed ? (t.logToolCalls || tools) : tools;
           const toolLabel = t.trimmed
             ? `原 ${shown} 次工具调用 · 现 0 次`
@@ -1309,6 +1366,8 @@ window.__ModuleLoader__.load({
           const saved = t.removedChars > 0 ? ` · 已移除 ~${fmtChars(t.removedChars)}` : '';
           const hasInjected = (t.injectedCount || 0) > 0;
           const blocked = busy || Boolean(t.running);
+          const showsTrim = tools > 0 || done;
+          const showsStrip = hasInjected;
           return h('div', {
             key: 'turn-' + t.label + '-' + t.startSeq,
             style: done ? { ...S.card, ...S.cardDone } : S.card,
@@ -1333,39 +1392,51 @@ window.__ModuleLoader__.load({
                     '（非你的提问）')
               : null,
             t.assistant ? h('div', null, h('strong', null, '回复：'), previewText(t.assistant, 100)) : null,
+            t.trimReason && !canTrim && showsTrim && !done
+              ? h('div', { style: S.note }, '不可修剪：' + t.trimReason)
+              : null,
+            hasInjected && !canStrip && !canStripDurable
+              ? h('div', { style: S.note }, '不可清除：' + (t.stripReason || '宿主拒绝'))
+              : null,
             h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end', flexWrap: 'wrap' } },
-              canTrim
+              showsTrim
                 ? h('button', {
                     key: 'trim',
                     type: 'button',
                     style: S.btn,
-                    disabled: blocked,
-                    title: t.running
-                      ? '这一轮还在进行中，结束后才能修剪'
-                      : '把本轮中间的工具调用与结果从模型上下文中移除，只保留提问与最终回答',
+                    disabled: blocked || !canTrim,
+                    title: !canTrim
+                      ? (t.trimReason || '当前不能修剪')
+                      : t.running
+                        ? '这一轮还在进行中，结束后才能修剪'
+                        : '把本轮中间的工具调用与结果从模型上下文中移除，只保留提问与最终回答',
                     onClick: () => act('trim_tools', t),
                   }, '✂️ 只留问答')
                 : null,
-              canStrip
+              showsStrip
                 ? h('button', {
                     key: 'strip',
                     type: 'button',
                     style: ephemeral > 0 ? S.btn : S.btnDanger,
-                    disabled: blocked,
-                    title: ephemeral > 0
-                      ? '清除本轮的一次性注入（时间戳等），保留你的提问'
-                      : '清除持久的系统注入（运行时快照、技能清单、AGENTS.md 等）。宿主只在其内容变化时重发，清除后本会话将失去这段说明',
+                    disabled: blocked || (!canStrip && !canStripDurable),
+                    title: !canStrip && !canStripDurable
+                      ? (t.stripReason || '当前不能清除')
+                      : ephemeral > 0
+                        ? '清除本轮的一次性注入（时间戳等），保留你的提问'
+                        : '清除持久的系统注入（运行时快照、技能清单、AGENTS.md 等）。宿主只在其内容变化时重发，清除后本会话将失去这段说明',
                     onClick: () => act('strip_injected', t),
-                  }, ephemeral > 0 ? '🧽 清注入' : '🧽 清持久注入')
+                  }, canStrip ? '🧽 清注入' : '🧽 清持久注入')
                 : null,
               h('button', {
                 key: 'del',
                 type: 'button',
                 style: S.btnDanger,
-                disabled: blocked,
-                title: t.running
-                  ? '这一轮还在进行中，结束后才能删除'
-                  : '把本轮问答从模型上下文中移除',
+                disabled: blocked || !canDelete,
+                title: !canDelete
+                  ? (t.deleteReason || '当前不能删除')
+                  : t.running
+                    ? '这一轮还在进行中，结束后才能删除'
+                    : '把本轮问答从模型上下文中移除',
                 onClick: () => act('delete_turn', t),
               }, '🗑 删除本轮')
             )
@@ -1479,6 +1550,33 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * Compact chat row for our own command.
+     *
+     * Every panel refresh runs `/trim_context {"action":"list_json"}` and its
+     * `command/done` carries the whole dump. Without this row the chat renders
+     * that JSON as a command summary; here it becomes one readable line.
+     */
+    function CommandView(props) {
+      const node = (props && props.node) || {};
+      const outcome = node.outcome || {};
+      const text = typeof outcome.text === 'string' ? outcome.text : '';
+      const prefix = '✂️ 上下文修剪器 · ' + (outcome.kind === 'error' ? '未执行：' : '');
+
+      // Only the machine dump is folded. The human `list` report is multi-line
+      // and must stay readable — collapsing it to one line hid every turn.
+      if (text.charAt(0) === '{') {
+        let label = '已更新上下文视图';
+        try {
+          const parsed = JSON.parse(text);
+          label = `已更新上下文视图（${Array.isArray(parsed.turns) ? parsed.turns.length : '?'} 轮 · ${parsed.build || '?'}）`;
+        } catch { /* keep the generic label */ }
+        return h('div', { style: { ...S.note, padding: '2px 0' } }, prefix + label);
+      }
+      return h('div', { style: { ...S.note, padding: '2px 0', whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+        prefix + text);
+    }
+
     function ToggleButton() {
       return h('button', {
         type: 'button',
@@ -1559,8 +1657,17 @@ window.__ModuleLoader__.load({
             const focusWhenReady = (attempt) => {
               let row = null;
               try {
+                let mounted = null;
+                try {
+                  if (svc.mounted && typeof svc.mounted.getSnapshot === 'function') mounted = svc.mounted.getSnapshot();
+                } catch { /* ignore */ }
                 const rows = svc.openTabs && svc.openTabs.getSnapshot ? svc.openTabs.getSnapshot() : [];
-                row = (rows || []).find((r) => r && r.kind === TAB_KIND);
+                // Only the on-screen session's tab is ours to focus; another
+                // session's tab of the same kind must not steal the click. The
+                // any-session fallback exists only while the surface has not
+                // reported its session yet.
+                row = (rows || []).find((r) => r && r.kind === TAB_KIND && (mounted === null || r.sessionId === mounted));
+                if (!row && mounted === null) row = (rows || []).find((r) => r && r.kind === TAB_KIND);
               } catch { /* ignore */ }
               if (row) {
                 try {
@@ -1648,6 +1755,11 @@ window.__ModuleLoader__.load({
               label: () => '上下文修剪器（降级）',
               inject: (sessionId) => ({ sessionId, ctx }),
             }, DockFallback)
+          )
+        );
+        disposers.push(
+          ctx.slots.inject('conversation.chat.commandview', () =>
+            ctx.slots.register({ name: 'conversation.chat.commandview', key: 'trim_context' }, CommandView)
           )
         );
 
